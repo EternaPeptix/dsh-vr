@@ -380,14 +380,19 @@ function cleanText(value, cap = 4000) {
 }
 
 export const EVIDENCE_FRONTMATTER = [
-  'id', 'thread', 'target_revision', 'configuration', 'kind', 'tier', 'created', 'title',
+  'id', 'thread', 'target_revision', 'configuration', 'kind', 'tier', 'created',
 ];
 
 /** Fence captured output, unwrapping any fence it was stored inside so re-renders stay stable. */
 export function fenced(content, lang = 'text') {
   let body = String(content ?? '').replace(/\r\n/g, '\n').trimEnd();
-  const wrapped = /^(`{3,})[a-z]*\n([\s\S]*)\n\1$/.exec(body);
-  if (wrapped !== null) body = wrapped[2];
+  // Repeatedly unwrap: older rewrites nested one fence per pass, so a single unwrap reproduced
+  // the damage instead of repairing it.
+  for (;;) {
+    const wrapped = /^(`{3,})[a-z]*\n([\s\S]*)\n\1$/.exec(body);
+    if (wrapped === null) break;
+    body = wrapped[2];
+  }
   const longest = (body.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
   const fence = '`'.repeat(Math.max(3, longest + 1));
   return `${fence}${lang}\n${body}\n${fence}`;
