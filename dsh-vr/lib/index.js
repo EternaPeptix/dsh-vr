@@ -76,10 +76,17 @@ const Config = z.object({
   deniedHosts: z.string().default(''),
   /** When true, ENGAGEMENT.md's allowed_hosts becomes an allowlist: anything else is refused. */
   enforceAllowedHosts: z.boolean().default(false),
+  /**
+   * Hosts the operator has cleared for reading reference material (articles, docs).
+   * These are not engagement targets: they never enter allowed_hosts and never authorise testing.
+   */
+  referenceHosts: z.string().default(''),
   /** How long an operator question waits before it settles as UNANSWERED. */
   questionTimeoutSeconds: z.number().default(300),
   /** Redirect the blocking built-in question tool to the timed one. */
   redirectQuestionTool: z.boolean().default(true),
+  /** Refuse goal blocks whose reason describes difficulty rather than an external obstacle. */
+  goalDiscipline: z.boolean().default(true),
 });
 
 const IGNORED_DIRS = new Set([
@@ -1335,6 +1342,43 @@ function noteQuestion(ctx, config, exec, status, detail) {
   }
 }
 
+/**
+ * Goals should persist, not surrender.
+ *
+ * The bundle allows `blocked` after three rounds, but agents reach for it far earlier, usually with a
+ * reason that describes difficulty ("unclear", "complex", "running low on context") rather than an
+ * external obstacle. Blocking disarms automatic continuation, so a soft block ends work that could
+ * have continued. This guard refuses the soft ones and says what would count as a real blocker.
+ */
+const SOFT_BLOCK = /(unclear|uncertain|not sure|ambiguous|complex|complicated|difficult|hard to|too many|time[- ]consuming|running low|context (window|limit)|overwhelmed|stuck|lost track|would take (a )?long)/i;
+
+const HARD_BLOCK = /(authori[sz]|credential|permission denied|\b40[13]\b|forbidden|network|offline|unreachable|unavailable|missing (file|dependency|tool|binary)|build fail|failed to build|cannot install|not installed|requires? (access|approval|authori[sz])|waiting (on|for)|blocked by|denied by)/i;
+
+function registerGoalDiscipline(ctx, config) {
+  if (!config.goalDiscipline) return;
+
+  ctx.effect(() => ctx.tools.guard((execution) => {
+    if (execution.name !== 'update_goal') return undefined;
+    const action = execution.arguments?.action;
+    if (action !== 'blocked') return undefined;
+
+    const reason = String(execution.arguments?.blocked_reason ?? '').trim();
+    if (reason === '') {
+      return 'action "blocked" needs a blocked_reason naming the external condition that stops you. If you cannot name one, keep working.';
+    }
+    if (!SOFT_BLOCK.test(reason) || HARD_BLOCK.test(reason)) return undefined;
+
+    return [
+      `refusing to block the goal: "${clip(reason, 120)}" describes difficulty, not a blocker.`,
+      'Blocking disarms automatic continuation, so the work stops here.',
+      'Keep going instead: take the smallest next step, and if you are genuinely blocked name the',
+      'external condition — a missing credential, a denied permission, an unreachable service, a',
+      'build that fails for a reason outside this repository — or record the partial result as a',
+      'blocker in the thread and leave the goal active.',
+    ].join(' ');
+  }), 'dsh-vr goal discipline');
+}
+
 function registerScopeTools(ctx, config) {
   ctx.tools.register(toolText({
     name: 'vr_scope_status',
@@ -1937,8 +1981,12 @@ function registerBoundaryGuard(ctx, config) {
     if (config.enforceAllowedHosts) {
       try {
         const allowed = await readAllowedHosts(await researchRoot(ctx, config, exec));
+        const reference = String(config.referenceHosts ?? '')
+          .split(',')
+          .map((host) => host.trim().toLowerCase())
+          .filter(Boolean);
         if (allowed.length > 0) {
-          outOfScope = contacted.find((host) => !hostPermitted(host, allowed));
+          outOfScope = contacted.find((host) => !hostPermitted(host, allowed) && !hostPermitted(host, reference));
         }
       } catch {
         outOfScope = undefined;
@@ -2209,6 +2257,7 @@ function apply(ctx, config) {
   registerScanEvalTool(ctx, config);
   registerScopeTools(ctx, config);
   registerQuestionTool(ctx, config);
+  registerGoalDiscipline(ctx, config);
   if (config.telemetry) registerTelemetry(ctx, config);
   registerBoundaryGuard(ctx, config);
   registerStateEnrichment(ctx, config);
