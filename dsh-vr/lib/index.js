@@ -1355,7 +1355,7 @@ const SOFT_BLOCK = /(unclear|uncertain|not sure|ambiguous|complex|complicated|di
 const HARD_BLOCK = /(authori[sz]|credential|permission denied|\b40[13]\b|forbidden|network|offline|unreachable|unavailable|missing (file|dependency|tool|binary)|build fail|failed to build|cannot install|not installed|blocked by|denied by)/i;
 
 /** A block that is really "I want the operator to answer something". */
-const QUESTION_BLOCK = /(waiting (on|for) (your|the user|the operator|a human|a (decision|reply|answer|response))|need(s|ed)? (your|the user'?s?|the operator'?s?|human) (input|decision|answer|confirmation|approval|clarification|guidance)|ask(ing)? (you|the user|the operator)|confirm (with you|whether)|clarif(y|ication)|you (decide|choose)|which (option|approach|host|target)|pending (your |their )?(approval|decision|response)|requires? (your|human|operator) (input|approval|decision|authori[sz]))/i;
+const QUESTION_BLOCK = /(waiting (on|for) (your|the user|the operator|a human|a (decision|reply|answer|response))|what i (need|want) from you|need(s|ed)? (your|the user|the operator|human)|ask(ing)? (you|the user|the operator)|confirm (with you|whether)|clarif(y|ication)|pending (your )?(approval|decision|response)|requires? (your|human|operator) (input|approval|decision|authori[sz])|\b(authori[sz]e|allow|permit|grant) me\b|\b(let me know|tell me)\b|\bdecide (whether|if|which)\b|which (option|approach|host|target)|if that('s| is) not (available|possible)|\bor accept\b|\b(you|your)\b.{0,80}\b(decide|choose|confirm|approve|accept|know|allow|authori[sz]e|tell me|prefer|want)\b|\b(decide|choose|confirm|approve|accept|prefer)\b.{0,80}\b(you|your)\b)/i;
 
 function registerGoalDiscipline(ctx, config) {
   if (!config.goalDiscipline) return;
@@ -1369,7 +1369,8 @@ function registerGoalDiscipline(ctx, config) {
     if (reason === '') {
       return 'action "blocked" needs a blocked_reason naming the external condition that stops you. If you cannot name one, keep working.';
     }
-    if (QUESTION_BLOCK.test(reason) && !HARD_BLOCK.test(reason)) {
+    // Asking permission is a question, even though "authorise"/"approval" also read as hard blockers.
+    if (QUESTION_BLOCK.test(reason)) {
       return [
         `refusing to block the goal: "${clip(reason, 120)}" is a question for the operator, not a blocker.`,
         'Blocking disarms automatic continuation and leaves the question unasked.',
