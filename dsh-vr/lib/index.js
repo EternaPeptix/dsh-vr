@@ -1506,15 +1506,20 @@ function registerScopeTools(ctx, config) {
       const fm = doc.frontmatter;
       const sections = doc.sections ?? {};
       const approved = args.approved === true;
+      const pending = String(sections['Pending scope request'] ?? '');
+      // A pending request means this verdict closes an expansion, not the engagement's scope.
+      // Rejecting an expansion must leave the existing qualification exactly as it was.
+      const isExpansion = pending.trim() !== '';
       if (approved) {
-        const pending = String(sections['Pending scope request'] ?? '');
         const added = [...pending.matchAll(/requested host:\s*(\S+)/gi)].map((match) => match[1].toLowerCase());
         if (added.length > 0) {
           const existing = String(fm.allowed_hosts ?? '').split(',').map((host) => host.trim()).filter(Boolean);
           fm.allowed_hosts = [...new Set([...existing, ...added])].join(', ');
-          delete sections['Pending scope request'];
         }
+        if (isExpansion) delete sections['Pending scope request'];
         fm.confirmed = 'true';
+      } else if (isExpansion) {
+        delete sections['Pending scope request'];
       } else {
         fm.confirmed = 'false';
       }
