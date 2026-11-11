@@ -136,6 +136,57 @@ try {
 check('a missing service is reported as the tool refusing, not as a crash',
   thrown instanceof Error && thrown.message.startsWith('vr_context:'), thrown?.message);
 
+// vr_repair must close the gap vr_evidence_add can leave: a file written but never linked.
+const threadDir = path.join(stateRoot, 'threads', 'thr-001');
+await fs.mkdir(path.join(threadDir, 'evidence'), { recursive: true });
+await fs.writeFile(path.join(threadDir, 'index.md'), [
+  '---',
+  'id: thr-001',
+  'engagement: test-202601',
+  'status: active',
+  'stage: validated',
+  'target: example@abc',
+  'created: 2026-01-01T00:00:00.000Z',
+  'updated: 2026-01-01T00:00:00.000Z',
+  '---',
+  '',
+  '# a thread',
+  '',
+  '## Evidence',
+  '',
+  'none',
+  '',
+  '## Question',
+  '',
+  'does the primitive reach the sink?',
+  '',
+].join('\n'));
+await fs.writeFile(path.join(threadDir, 'evidence', 'E-001.md'), [
+  '---',
+  'id: E-001',
+  'thread: thr-001',
+  'kind: execution',
+  'tier: function',
+  'session: sess-a',
+  'created: 2026-01-01T00:00:00.000Z',
+  '---',
+  '',
+  '# the check',
+  '',
+].join('\n'));
+
+const repairTool = registered.find((spec) => spec.name === 'vr_repair');
+const repairExec = { agent: { session: { id: 'load-test' } } };
+const dryRun = await repairTool.execute({}, repairExec);
+const untouched = await fs.readFile(path.join(threadDir, 'index.md'), 'utf8');
+check('vr_repair reports an unlinked evidence file without writing', dryRun.includes('would be linked') && !untouched.includes('E-001.md'), dryRun);
+
+const applied = await repairTool.execute({ apply: true }, repairExec);
+const linked = await fs.readFile(path.join(threadDir, 'index.md'), 'utf8');
+check('vr_repair links it when asked', linked.includes('E-001.md'), applied);
+check('the second pass has nothing left to do',
+  (await repairTool.execute({}, repairExec)).includes('no inconsistencies'), 'still reports work');
+
 await fs.rm(stateRoot, { recursive: true, force: true });
 
 console.log(failures === 0 ? 'all load cases passed' : `${failures} load case(s) failed`);
