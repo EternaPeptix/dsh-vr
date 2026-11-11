@@ -183,6 +183,18 @@ async function readEngagement(root) {
 }
 
 /** Parsed ENGAGEMENT.md, or undefined when it is absent. */
+/**
+ * The attention ceiling that actually applies.
+ *
+ * ENGAGEMENT.md carries a `concurrency` field; reading it only in one tool would leave the same
+ * number meaning different things in different places, so every caller resolves it the same way.
+ */
+async function activeCeilingFor(root, config) {
+  const parsed = await engagementDoc(root);
+  const declared = Number.parseInt(String(parsed?.frontmatter?.concurrency ?? ''), 10);
+  return Number.isInteger(declared) && declared > 0 ? declared : config.maxActiveThreads;
+}
+
 async function engagementDoc(root) {
   const text = await readIfExists(path.join(root, 'ENGAGEMENT.md'));
   if (text === undefined) return undefined;
@@ -339,8 +351,19 @@ async function evidenceStatesFor(root, id, parsed) {
     // Byte identity: an artifact cited as evidence must still hash to what the record says.
     const artifacts = [];
     for (const line of String(evidence.sections.Artifacts ?? '').split('\n')) {
-      const match = /^-\s+(.*?)\s+\(sha256:([0-9a-f]{16,64})/.exec(line.trim());
-      if (match === null) continue;
+      const trimmed = line.trim();
+      const match = /^-\s+(.*?)\s+\(sha256:([0-9a-f]{16,64})/.exec(trimmed);
+      if (match === null) {
+        // An artifact named without a hash cannot be checked for drift. Skipping these silently made
+        // an unverifiable citation indistinguishable from a verified one, so they are kept and the
+        // gate reports them as a caveat instead.
+        const bare = /^-\s+(.+)$/.exec(trimmed);
+        if (bare !== null) {
+          const cited = bare[1].replace(/\s+\((?:not readable|hash unavailable)[^)]*\)\s*$/i, '').trim();
+          if (cited !== '' && cited.toLowerCase() !== 'none') artifacts.push({ path: cited, unhashed: true });
+        }
+        continue;
+      }
       const [, cited, recorded] = match;
       let ok;
       try {
@@ -552,6 +575,9 @@ function registerStateTools(ctx, config) {
       const engagement = await readEngagement(root);
       // Attention ceiling: refuse to start work that cannot be followed through. Counted per
       // engagement, so a new engagement is not blocked by threads from an earlier one.
+      // The engagement's own `concurrency` used to be written into ENGAGEMENT.md and read by nobody,
+      // which made a documented limit look enforced while the config value silently ruled.
+      const activeCeiling = await activeCeilingFor(root, config);
       const activeIds = [];
       for (const other of await listThreadIds(root)) {
         const { parsed } = await readThread(root, other).catch(() => ({ parsed: undefined }));
@@ -561,7 +587,7 @@ function registerStateTools(ctx, config) {
         const otherEngagement = String(parsed.frontmatter.engagement ?? 'unscoped');
         if (otherEngagement === engagement) activeIds.push(other);
       }
-      if (activeIds.length >= config.maxActiveThreads) {
+      if (activeIds.length >= activeCeiling) {
         let stalest;
         let stalestStamp;
         for (const other of activeIds) {
@@ -573,7 +599,7 @@ function registerStateTools(ctx, config) {
           }
         }
         throw new Error(
-          `refusing to open another thread in engagement "${engagement}": ${activeIds.length} are already active (limit ${config.maxActiveThreads}): ${activeIds.join(', ')}. Start with ${stalest} — last touched ${stalestStamp || 'unknown'} — and close or defer it with vr_thread_update before starting more work.`,
+          `refusing to open another thread in engagement "${engagement}": ${activeIds.length} are already active (limit ${activeCeiling}): ${activeIds.join(', ')}. Start with ${stalest} — last touched ${stalestStamp || 'unknown'} — and close or defer it with vr_thread_update before starting more work.`,
         );
       }
       const id = await nextThreadId(root);
@@ -626,8 +652,9 @@ function registerStateTools(ctx, config) {
     async run(_args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const engagement = await readEngagement(root);
+      const ceiling = await activeCeilingFor(root, config);
       const ids = await listThreadIds(root);
-      if (ids.length === 0) return `engagement: ${engagement}  open: 0/${config.maxActiveThreads}\nno threads`;
+      if (ids.length === 0) return `engagement: ${engagement}  open: 0/${ceiling}\nno threads`;
       const lines = [];
       let open = 0;
       for (const id of ids) {
@@ -639,7 +666,7 @@ function registerStateTools(ctx, config) {
         if ((status === 'active' || status === 'untested') && otherEngagement === engagement) open += 1;
         lines.push(`${id}  ${status}  engagement=${otherEngagement}  stage=${parsed.frontmatter.stage ?? 'none'}  evidence: ${links.map((l) => l.id).join(',') || 'none'}  ${question}`);
       }
-      return [`engagement: ${engagement}  open: ${open}/${config.maxActiveThreads}`, ...lines].join('\n');
+      return [`engagement: ${engagement}  open: ${open}/${ceiling}`, ...lines].join('\n');
     },
   }));
 
@@ -1150,6 +1177,13 @@ function registerStateTools(ctx, config) {
         `evidence: ${gate.links.length} linked, ${gate.completeCount} complete, ${gate.executedCount ?? 0} executed`,
         `attempts: ${fm.attempts ?? '0'}/${config.maxAttempts}${Number.parseInt(fm.attempts ?? '0', 10) >= config.maxAttempts ? ' — attempt budget exhausted (wording applies to HOLD outcomes; a REPORT here converged)' : ''}`,
         ...gate.reasons.map((reason) => `  - ${reason}`),
+        ...(Array.isArray(gate.caveats) && gate.caveats.length > 0
+          ? [
+              '',
+              'caveats (they do not block the decision, but they describe support that cannot be checked):',
+              ...gate.caveats.map((caveat) => `  ! ${caveat}`),
+            ]
+          : []),
         '',
         gate.decision === 'REPORT'
           ? 'Evidence supports drafting. Impact and severity remain the researcher\'s judgement.'
@@ -1888,7 +1922,8 @@ function registerScopeTools(ctx, config) {
         target: host,
         authorization: 'PENDING',
         allowed_hosts: host,
-        concurrency: '5',
+        // Written from the configured ceiling so the file states the limit that applies.
+        concurrency: String(config.maxActiveThreads),
         confirmed: 'false',
         updated: nowIso().slice(0, 10),
       };
@@ -1941,7 +1976,8 @@ function registerScopeTools(ctx, config) {
         revision: clean(args.revision ?? '', 200),
         authorization: clean(args.authorization, 400),
         allowed_hosts: hosts.join(', '),
-        concurrency: '5',
+        // Written from the configured ceiling so the file states the limit that applies.
+        concurrency: String(config.maxActiveThreads),
         confirmed: 'false',
         updated: nowIso().slice(0, 10),
       };

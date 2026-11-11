@@ -64,6 +64,19 @@ export const THREAD_FRONTMATTER = [
 ];
 
 /**
+ * Strip one fence layer from a stored block.
+ *
+ * The info string is accepted as any run of characters that are neither a newline nor a backtick,
+ * not just `[a-z]*`: a block stored as ```json5 or ```c++ failed the narrower pattern, so it did not
+ * unwrap on read and every subsequent rewrite added another fence layer around it. The opening run
+ * must be closed by an equally long run, which is what keeps a nested three-backtick block intact.
+ */
+function unwrapFence(body) {
+  const wrapped = /^(`{3,})[^\n`]*\n([\s\S]*)\n\1$/.exec(String(body));
+  return wrapped === null ? String(body) : wrapped[2];
+}
+
+/**
  * Parse the frontmatter subset used by the state files: `key: value` lines only.
  *
  * Section headings are recognised line by line and only outside fenced code blocks, because captured
@@ -97,9 +110,7 @@ export function parseStateFile(text) {
   let buffer = [];
   const flush = () => {
     if (current !== undefined) {
-      const raw = buffer.join('\n').trim();
-      const wrapped = /^(`{3,})[a-z0-9]*\n([\s\S]*)\n\1$/.exec(raw);
-      sections[current] = wrapped === null ? raw : wrapped[2];
+      sections[current] = unwrapFence(buffer.join('\n').trim());
       if (order.filter((name) => name === current).length > 1) duplicates.push(current);
     }
     buffer = [];
@@ -352,6 +363,17 @@ export function evaluateGate(parsed, evidenceStates) {
     const changed = state.artifacts.filter((a) => a.ok === false).map((a) => a.path).join(', ');
     blocking.push(`artefact no longer matches what the record hashed: ${state.id} → ${changed}`);
   }
+  // A citation that was stored without a hash cannot be checked for drift, so it is reported rather
+  // than skipped. It does not block on its own: records written before hashing existed are still
+  // legitimate work, and refusing them outright would strand the engagement rather than fix it.
+  const caveats = [];
+  for (const state of evidenceStates) {
+    const bare = Array.isArray(state.artifacts) ? state.artifacts.filter((a) => a.unhashed) : [];
+    if (bare.length === 0) continue;
+    caveats.push(
+      `${state.id} names ${bare.map((a) => a.path).join(', ')} without a recorded hash: drift cannot be detected, so this citation is not verified`,
+    );
+  }
   const linkedIds = evidenceLinks(sections).map((link) => link.id);
   const citesId = (text) => linkedIds.some((id) => new RegExp(`(?<![A-Za-z0-9])${id}(?![0-9])`).test(String(text ?? '')));
   if (!citesId(sections['Current assessment'])) {
@@ -385,6 +407,7 @@ export function evaluateGate(parsed, evidenceStates) {
   return {
     decision: blocking.length === 0 ? 'REPORT' : 'HOLD',
     reasons: blocking.length === 0 ? ['claim is validated, attributed and revalidated'] : blocking,
+    caveats,
     links,
     completeCount,
     executedCount: executed.length,
@@ -407,9 +430,9 @@ export function fenced(content, lang = 'text') {
   // Repeatedly unwrap: older rewrites nested one fence per pass, so a single unwrap reproduced
   // the damage instead of repairing it.
   for (;;) {
-    const wrapped = /^(`{3,})[a-z]*\n([\s\S]*)\n\1$/.exec(body);
-    if (wrapped === null) break;
-    body = wrapped[2];
+    const next = unwrapFence(body);
+    if (next === body) break;
+    body = next;
   }
   const longest = (body.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
   const fence = '`'.repeat(Math.max(3, longest + 1));
@@ -421,11 +444,37 @@ export function fmValue(value) {
   return String(value ?? '').replace(/\s*\n\s*/g, ' ').trim();
 }
 
-export function renderThread(fm, sections) {
-  const lines = ['---'];
-  for (const key of THREAD_FRONTMATTER) {
+/**
+ * Frontmatter keys this module does not know about are preserved, not dropped.
+ *
+ * Reading is lossy in one direction only: whatever is not in the rendered list was deleted by the
+ * next rewrite — operator annotations, fields written by a newer version of the harness, anything
+ * added by hand. Unknown keys are emitted after the known ones in their stored order, and only when
+ * the key itself could be read back as one.
+ */
+const FM_KEY = /^[A-Za-z][A-Za-z0-9_-]*$/;
+/** Keys that are rendered as document structure rather than as frontmatter. */
+const FM_NOT_FRONTMATTER = new Set(['title']);
+
+function frontmatterLines(fm, known) {
+  const lines = [];
+  for (const key of known) {
+    if (key === undefined) continue;
     if (fm[key] !== undefined && fm[key] !== '') lines.push(`${key}: ${fmValue(fm[key])}`);
   }
+  const seen = new Set([...known, ...FM_NOT_FRONTMATTER]);
+  for (const key of Object.keys(fm ?? {})) {
+    if (seen.has(key)) continue;
+    if (!FM_KEY.test(key)) continue;
+    if (fm[key] === undefined || fm[key] === null || fm[key] === '') continue;
+    lines.push(`${key}: ${fmValue(fm[key])}`);
+  }
+  return lines;
+}
+
+export function renderThread(fm, sections) {
+  const lines = ['---'];
+  lines.push(...frontmatterLines(fm, THREAD_FRONTMATTER));
   lines.push('---', '');
   lines.push(`# ${fm.title ?? fm.id}`, '');
   for (const section of THREAD_SECTIONS) {
@@ -437,9 +486,7 @@ export function renderThread(fm, sections) {
 
 export function renderEvidence(fm, sections) {
   const lines = ['---'];
-  for (const key of EVIDENCE_FRONTMATTER) {
-    if (fm[key] !== undefined && fm[key] !== '') lines.push(`${key}: ${fmValue(fm[key])}`);
-  }
+  lines.push(...frontmatterLines(fm, EVIDENCE_FRONTMATTER));
   lines.push('---', '');
   lines.push(`# ${fm.title ?? fm.id}`, '');
   for (const section of EVIDENCE_SECTIONS) {
