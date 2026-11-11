@@ -11,9 +11,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { loadJournal } from '../lib/journal.js';
-import { JOURNAL_FILE, journalKey, readAnchor } from '../lib/store.js';
+import { JOURNAL_FILE, journalKey, openStore, readAnchor } from '../lib/store.js';
 import { evidenceDoc, threadDoc } from '../lib/views.js';
 import { importLegacy } from '../tools/journal.mjs';
+import { readLegacy } from '../tools/legacy-markdown.mjs';
 
 let failures = 0;
 const check = (name, ok, detail) => {
@@ -170,6 +171,7 @@ await put('DEFERRALS.md', [
 ].join('\n'));
 
 const before = (await fs.readdir(root, { recursive: true })).sort().join('\n');
+const asWritten = await readLegacy(root);
 const dry = await importLegacy(root, { keyFile, dryRun: true });
 check('a dry run reads the directory and writes nothing to it',
   dry.written === false && dry.counts.threads === 1 && (await fs.readdir(root, { recursive: true })).sort().join('\n') === before,
@@ -214,8 +216,8 @@ check('artifact lines keep what they recorded: no hash, a hash and size, or unre
   JSON.stringify(first.artifacts));
 
 const shown = evidenceDoc(state, 'thr-001', 'E-001').sections.Artifacts.split('\n');
-check('the view does not call a never-hashed artifact unreadable',
-  shown[0] === '- out/run.log — worker log (no hash recorded)'
+check('the view shows a never-hashed artifact as the line it was, not as unreadable',
+  shown[0] === '- out/run.log — worker log'
     && shown[1].startsWith('- out/poc.bin (sha256:0123456789abcdef')
     && shown[2] === '- out/gone.txt (not readable when recorded: hash unavailable)',
   shown.join(' | '));
@@ -223,6 +225,32 @@ check('the thread view lists its evidence under the titles the records now carry
   threadDoc(state, 'thr-001').links.map((link) => `${link.id}: ${link.title}`).join(' | ')
     === 'E-001: the reproducer overwrites the canary | E-002: with the bounds check restored the canary survives',
   threadDoc(state, 'thr-001').links.map((link) => `${link.id}: ${link.title}`).join(' | '));
+
+// Going back is putting the old plugin over the views the journal wrote, so those views have to
+// say what the Markdown said. A view worded in a way the old reader takes differently would make
+// an import a one-way door.
+const viewProblem = await openStore(root, { keyFile }).writeViews(state, undefined);
+const asRendered = await readLegacy(root);
+// Key order is not state: a title read from the heading and one read from the frontmatter are the
+// same title.
+const canonical = (value) => JSON.stringify(value, (key, inner) => (
+  inner !== null && typeof inner === 'object' && !Array.isArray(inner)
+    ? Object.fromEntries(Object.keys(inner).sort().map((name) => [name, inner[name]]))
+    : inner
+));
+const firstDifference = () => {
+  const before = asWritten.batches.map(canonical);
+  const after = asRendered.batches.map(canonical);
+  const index = before.findIndex((entry, at) => entry !== after[at]);
+  if (index === -1) return before.length === after.length ? undefined : `${before.length} batch(es) became ${after.length}`;
+  const a = before[index];
+  const b = after[index] ?? '';
+  let at = 0;
+  while (at < a.length && a[at] === b[at]) at += 1;
+  return `${asWritten.batches[index].label}: …${a.slice(Math.max(0, at - 60), at + 80)}… became …${b.slice(Math.max(0, at - 60), at + 80)}…`;
+};
+check('the views written from the journal read back as the state that was imported',
+  viewProblem === undefined && firstDifference() === undefined, viewProblem ?? firstDifference());
 
 const again = await importLegacy(root, { keyFile }).then(() => undefined, (error) => error.message);
 check('a directory that has a journal is not imported twice', typeof again === 'string' && again.includes('already exists'), again ?? 'ACCEPTED');

@@ -160,7 +160,9 @@ function artifactsOf(sectionText) {
     }
     const bare = /^-\s+(.+)$/.exec(trimmed);
     if (bare === null) continue;
-    const note = /\s+\((?:not readable|hash unavailable|no hash recorded)[^)]*\)\s*$/i;
+    // Only the note the old harness wrote is taken off. Anything else in brackets is part of what
+    // the line cites, and a view worded some new way must fail to read back rather than pass.
+    const note = /\s+\((?:not readable|hash unavailable)[^)]*\)\s*$/i;
     const cited = bare[1].replace(note, '').trim();
     // A line the harness marked unreadable keeps that mark; a bare line never had a hash at all.
     if (present(cited)) artifacts.push({ path: cited, ...(/\((?:not readable|hash unavailable)/i.test(bare[1]) ? { unreadable: true } : {}) });

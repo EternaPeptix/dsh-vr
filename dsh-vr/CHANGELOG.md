@@ -17,8 +17,8 @@
   `node tools/journal.mjs import <research dir>` has been run once. The import is not reversible in
   place: keep a copy of the directory. Imported execution records are attested against whatever the
   telemetry ledger still holds on that day. An evidence title that existed only in a thread's link
-  text is moved onto the record, and an artifact line that never had a hash is shown as
-  `(no hash recorded)` rather than as unreadable. The import has its own test suite.
+  text is moved onto the record, and an artifact line that never had a hash keeps the bare path it
+  had rather than being shown as unreadable. The import has its own test suite.
 - Journal lines are sealed with an HMAC chained to the previous line, under a key outside the
   research directory (`journalKeyFile`, default `~/.dsh-vr/journal.key`). An edited, added, removed
   or reordered line, a journal cut short of the position last written, a replaced journal and a

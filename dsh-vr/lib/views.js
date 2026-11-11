@@ -105,11 +105,12 @@ export function artifactLines(artifacts) {
       const size = Number.isInteger(artifact.bytes) ? `, ${artifact.bytes} bytes` : '';
       return `- ${fmValue(artifact.path)} (sha256:${artifact.sha256.slice(0, 16)}…${size})`;
     }
-    // Two histories end without a hash, and the view says which: the file could not be read when the
-    // record was written, or the record predates hashing and never had one.
+    // Two histories end without a hash. A file that could not be read when the record was written
+    // says so; a record that predates hashing shows the bare path it always showed, so that a view
+    // regenerated from an imported record is the line that was imported.
     return artifact?.unreadable === true
       ? `- ${fmValue(artifact.path)} (not readable when recorded: hash unavailable)`
-      : `- ${fmValue(artifact?.path)} (no hash recorded)`;
+      : `- ${fmValue(artifact?.path)}`;
   }).join('\n');
 }
 
