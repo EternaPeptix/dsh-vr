@@ -32,8 +32,9 @@ ln -s /path/to/dsh-vr ~/.dsh/profiles/<profile>/node_modules/dsh-vr
 cp cordis.patch.example.yml ~/.dsh/profiles/<profile>/cordis.patch.yml
 ```
 
-Then edit `cordis.patch.yml`: `root`, an absolute `enrichRoot`, your denied hosts, and whether
-`enforceAllowedHosts` is on. The real patch file is gitignored because it names one engagement
+Then edit `cordis.patch.yml`: `root`, an absolute `enrichRoot`, your denied hosts, whether
+`enforceAllowedHosts` is on, and `journalKeyFile` if the journal key should live somewhere other than
+`~/.dsh-vr/journal.key`. The real patch file is gitignored because it names one engagement
 workspace and that engagement's hosts.
 
 Restart the Host after changing plugin code. The Host imports the module once per process, so edits on
@@ -44,7 +45,7 @@ disk do not take effect in a running session.
 The intended shape of a session:
 
 1. Operator supplies a programme or scope-page URL.
-2. `vr_scope_intake` writes a provisional `research/ENGAGEMENT.md` and returns a brief.
+2. `vr_scope_intake` records a provisional, unqualified engagement and returns a brief.
 3. That brief goes to one subagent verbatim; it reads the page and calls `vr_scope_apply`.
 4. The brief returned by `vr_scope_apply` goes to a different subagent, the judge, which fetches the
    page itself and answers with `Hosts read on the page: ...`.
@@ -75,19 +76,49 @@ says nothing about severity.
 
 ## The research state
 
-Everything lives under `research/` in the engagement workspace:
+The state is one file: `research/journal.jsonl`. Each line is one tool call's changes — typed
+records for the engagement, threads, evidence, deferrals and completion claims — and the state is
+what the lines add up to. Nothing is ever parsed back out of prose.
 
-- `ENGAGEMENT.md` — scope, allowed hosts, decisions. Written only by the scope tools.
-- `threads/<id>/index.md` — one experiment: question, hypothesis, scope, assessment, evidence links,
-  attribution, revalidation, attempts.
-- `threads/<id>/evidence/E-NNN.md` — one atomic check: conditions, request, observed response, a
-  separate state check, limitations, hashed artifacts.
-- `threads/INDEX.md` — derived; regenerated after every write.
-- `DEFERRALS.md` — obstacles recorded instead of ending a goal.
-- `telemetry/events.jsonl` — harness output. Never evidence, never to be pasted into a report.
+- A thread's evidence list, an evidence record's kind, tier and artifact hashes, an engagement's
+  allowed hosts and its `confirmed` flag are fields. Text supplied by the agent, or copied off a
+  target, is stored as a string in a field and cannot turn into a heading, a key or a verdict.
+- One tool call is one entry, appended under a lock: an evidence record and the link to it are
+  written together or not at all. Writing tools run one at a time, and a write that finds the journal
+  changed underneath it by another process is refused rather than applied, so an id is never handed
+  out twice.
+- Each line carries an HMAC over its content and the previous line's seal, keyed by a file outside the
+  research directory (`~/.dsh-vr/journal.key`, or `journalKeyFile`). A line that was edited, removed,
+  reordered or added without the key fails verification, and so does a journal that ends earlier than
+  the position this machine last wrote, or that was deleted.
+- A journal that fails verification is refused whole: no tool reads or writes it, no scope counts as
+  qualified, and the host guard permits nothing beyond loopback. The refusal names the line.
 
-Sections are fenced when written and unwrapped when read, so captured output that contains `##` cannot
-forge a heading. Unknown frontmatter keys are preserved rather than dropped.
+The Markdown under `research/` is still there, for people:
+
+- `ENGAGEMENT.md`, `threads/<id>/index.md`, `threads/<id>/evidence/E-NNN.md`, `threads/INDEX.md` and
+  `DEFERRALS.md` are **generated views**: after each entry, the ones it touched are rewritten.
+  Nothing reads them. Editing one changes nothing, and the next write to that record overwrites the
+  edit; `vr_repair apply: true` rewrites all of them.
+- `telemetry/events.jsonl` is harness output, as before. Never evidence, never to be pasted into a
+  report.
+
+Operator commands, none of which the plugin runs itself:
+
+```sh
+node tools/journal.mjs verify research      # every line and its seal
+node tools/journal.mjs render research      # rewrite every Markdown view
+node tools/journal.mjs reseal research      # accept the journal as it stands; keeps a copy first
+node tools/journal.mjs import research      # one-off: state written before the journal existed
+node tools/vr.mjs --root research list      # read-only: list, show, gate, stages, telemetry, decisions
+```
+
+A directory that holds Markdown state from before the journal and no journal is refused until it has
+been imported once; `import --dry-run` reports what would be written. `tools/vr.mjs` reads the journal
+the way the plugin does and never writes: no key is created, no lock is taken, no view is refreshed.
+
+What the seal is worth is stated under [Residual risk](#residual-risk). Back the key up with the
+journal: a journal without its key cannot be verified, only resealed.
 
 The pipeline is a pipeline, not a menu:
 
@@ -107,24 +138,26 @@ repeated consistently in two tools, in a list the researcher can diff against th
 
 An approved expansion merges only the requested hosts, and never qualifies an engagement that was not
 qualified by its own verdict. Intake refuses to overwrite an engagement that is already qualified
-unless called with `force: true`, which archives the previous file first.
+unless called with `force: true`, which keeps the previous engagement in the journal's history and
+as an `ENGAGEMENT.<timestamp>.md` view.
 
-`ENGAGEMENT.md` is written from text copied off a programme page, so none of that text is allowed to
-become structure. Every frontmatter value is folded to one line (LF, CR, CRLF, U+2028, U+2029, NEL and
-the other control characters), which is what keeps a field from carrying its own `confirmed: true`.
-Free text in a section has any line that would read as a heading, a title or a code fence escaped
-with a backslash. A scope entry must be one bare host — `acme.test`, `*.acme.test`, `acme.test:8443`,
-an IP literal — and anything else is refused rather than repaired, so the judge is never shown a
-different string from the one that was stored. An expansion merges only the hosts on the request's
-own leading `requested host:` lines, not hosts its justification or evidence text mentions.
+Scope text is copied off a programme page, so none of it is allowed to become structure. It is stored
+as fields: only `vr_scope_decide` sets the `confirmed` flag to true, the allowed hosts are
+a list, and a pending expansion's hosts are the request's own list rather than lines found in its
+justification. A scope entry must be one bare host — `acme.test`, `*.acme.test`, `acme.test:8443`, an
+IP literal — and anything else is refused rather than repaired, so the judge is never shown a
+different string from the one that was stored. The generated `ENGAGEMENT.md` still folds every value to
+one line and escapes lines that would read as headings or fences, so the view reads the way the
+record is.
 
 ## Boundary enforcement — read this before trusting it
 
 Two modes, and they are not equivalent:
 
 - `enforceAllowedHosts: true` — default-deny against `allowed_hosts`, loopback permitted, and the
-  programme page itself reachable so the judge can read it. An engagement that is not `confirmed: true`
-  permits nothing beyond loopback and that page. This is the strong mode.
+  programme page itself reachable so the judge can read it. An engagement that is not confirmed
+  permits nothing beyond loopback and that page, and a journal that cannot be read or fails
+  verification permits nothing beyond loopback. This is the strong mode.
 - `deniedHosts` — a best-effort denylist over URLs and the arguments of known network clients at a
   command position, including after wrappers such as `sudo`, `time` or `xargs`, and inside `$( )`.
 
@@ -141,20 +174,21 @@ A refusal is recorded, not announced. If it matters, it is in the ledger.
 
 ## Completion
 
-`update_goal action=complete` is refused. `vr_finish_goal` records a claim, fingerprints the named
-artifacts, and returns a brief for an independent verifier whose verdict is recorded with
-`vr_completion_decide`. The claim is bound to the goal it was made about: a verdict about a different
-goal, an expired claim, or an artifact that changed after the claim is refused rather than applied.
-A rejection leaves the goal active.
+`update_goal action=complete` is refused. `vr_finish_goal` records a claim in the journal, fingerprints
+the named artifacts, and returns a brief for an independent verifier whose verdict is recorded with
+`vr_completion_decide`. There is one pending claim per goal, and it is bound to that goal: a verdict
+about a different goal, an expired claim, or an artifact that changed after the claim is refused
+rather than applied. A rejection leaves the goal active.
 
 Attestation is a consistency check, not proof: an executed evidence record names the session that wrote
-it, and `vr_gate` reports a caveat when that session shows no execution-capable tool call that finished
-before the record was written.
+it, and whether that session had finished an execution-capable tool call is decided when the record is
+written and stored with it. `vr_gate` reports an unattested record as a caveat, and that answer does
+not change when the telemetry ledger later rotates.
 
 ## Findings dashboard
 
 A read-only panel in the Harness Web UI lists threads grouped by engagement, with gate decisions,
-blocking-rule frequency, unlinked evidence files, and a manual refresh that shows when it last
+blocking-rule frequency, unlinked evidence records, and a manual refresh that shows when it last
 succeeded. It refuses requests whose `Host` or `Origin` is not loopback, which closes the
 DNS-rebinding path to engagement data. It has no authentication: if you put a tunnel in front of it,
 name the tunnel host in `dashboardAllowHosts` and add your own access control there. A Hide findings
@@ -165,13 +199,15 @@ toggle blurs question text for screen sharing.
 Defaults are in `lib/index.js`. The ones that change behaviour:
 
 - `root`, `enrichRoot` — where state lives, and where the prompt-time summary is read from.
+- `journalKeyFile` — the key that seals the journal. Default `~/.dsh-vr/journal.key`, created on the
+  first write. Keep it outside the workspace the agent works in.
 - `enforceAllowedHosts`, `deniedHosts`, `referenceHosts`, `allowLoopback`, `guardedTools`.
   `referenceHosts` exempts only the fetch tool, never shell.
 - `executionTools` — which tool names count as running the target when attesting evidence.
 - `questionTimeoutSeconds`, `redirectQuestionTool` — operator questions settle as UNANSWERED instead
   of hanging.
 - `goalBlockPolicy`, `goalDiscipline` — model-initiated goal blocks are refused.
-- `maxActiveThreads`, `fanoutCeiling` — attention limits; `research/ENGAGEMENT.md` may set a lower
+- `maxActiveThreads`, `fanoutCeiling` — attention limits; the engagement record may set a lower
   ceiling for one engagement.
 - `maxAttempts`, `maxEntries`, `maxFileBytes`, `deferralsMaxEntries` — give-up, size and retention
   bounds.
@@ -188,15 +224,23 @@ rejected at load time.
 npm test
 ```
 
-Five suites:
+Six suites:
 
 - gate scenarios, including the refusal cases that must never become `REPORT`;
-- record round-trip, where render → parse → render must be byte-identical;
+- view round-trip, where render → parse → render must be byte-identical. The parser lives only in the
+  importer now; this keeps the views and the importer honest about each other;
 - regressions for record-integrity, scope grounding, completion binding and placeholder handling;
+- the one-off import, against a directory shaped like the early ones: a title held only in a thread's
+  link text, artifact lines with and without a hash, a record the thread never linked, and the two
+  refusals that stop a directory being imported twice;
 - host extraction from shell commands, including the forms that must be denied and the prose that must
   not be;
-- a load test that imports the real plugin entry point against stubbed Harness packages, so a tool that
-  fails to register or a config key that does not exist fails here instead of at startup.
+- a load test that imports the real plugin entry point against stubbed Harness packages and drives
+  the tools and hooks: a tool that fails to register or a config key that does not exist fails here
+  instead of at startup, and so does a tool that stops keeping the journal's rules — an edited,
+  truncated, replaced or deleted journal, ids allocated at once, a thread walked from open to
+  `REPORT`, a scope steered by the text it records, the host guard under each of those. State is
+  read back from the journal file with the key, never from the generated Markdown.
 
 Run them after any change to `lib/`. They are fast and they catch the class of mistake that is
 otherwise invisible until a Host refuses to start.
@@ -207,7 +251,14 @@ Paths are relative to `dsh-vr/`.
 
 ```
 lib/index.js        tools, guards, telemetry, dashboard route
-lib/rules.js        pure gate and parsing rules, shared by tools and tests
+lib/journal.js      what a journal line means: records, sealing, verification (pure)
+lib/store.js        the journal on disk: lock, append, key, last-written position
+lib/views.js        records as documents, and the generated Markdown views
+lib/evidence.js     what the gate is told about a thread's evidence
+lib/rules.js        pure gate, stage, scope and host rules, shared by tools and tests
+tools/journal.mjs   operator commands: import, verify, render, reseal
+tools/vr.mjs        read-only terminal view over the journal
+tools/legacy-markdown.mjs   the old Markdown reader, kept only for the importer
 client.js           findings dashboard panel (web client half)
 test/               five suites and the stubs the load test needs
 cordis.patch.example.yml   configuration template
@@ -224,24 +275,28 @@ before the record, cited artifacts are hashed at record time, attribution must c
 revalidation must name the revision it was checked against, and completion claims are bound to their
 goal. Each raises the cost of a false claim; none observes the target.
 
+The journal's seal is tamper evidence, not confinement. It stops what used to work — writing
+`confirmed: true` into a file, editing a thread's stage, deleting an inconvenient record — because
+none of those survive verification, and it makes an injected "just edit the scope file" instruction
+harmless. It does not stop an agent that goes looking for the key: the key file is outside the
+research directory but readable by the same OS user, and a process that reads it can seal its own
+lines. Closing that takes a key the agent's user cannot read — a separate account, a keychain item
+with an access prompt, or a signing service — and this plugin does not provide one.
+
 ## Known gaps
 
 These are real and unfixed as of this commit:
 
-- `ENGAGEMENT.md` is an ordinary file in the workspace. The scope tools can no longer be steered into
-  writing `confirmed: true`, but an agent with a shell or a file-write tool can still write it
-  directly: nothing binds the stored verdict to the judge that gave it, and the boundary guard reads
-  the same file. Until the verdict is signed or kept outside the agent's reach, a qualified scope
-  means "the file says so", not "a judge said so".
-- Thread and evidence ids are allocated by reading the directory; concurrent tool calls can race and
-  both claim the same id.
-- `vr_evidence_classify`, `vr_attempt`, `vr_attribution` and `vr_revalidate` still accept writes to
-  terminal threads in some paths.
-- Reopening restores the stage to `assessed` regardless of where the thread stopped.
+- The journal key is readable by the agent's own OS user; see [Residual risk](#residual-risk).
+- The last-written position that detects a rolled-back journal is kept beside the key, per machine. A
+  journal copied to another machine is verified line by line there, but not against a position.
+- The journal is verified and replayed whole whenever the file has changed, and there is no
+  compaction. Measured on synthetic entries of about 1 KB: 45 ms at 1,000 entries, 0.14 s at 5,000,
+  0.8 s at 20,000. An engagement of several hundred threads stays well under that; a workspace that
+  outgrows it will feel it on every write.
 - `vr_scan` compiles agent-supplied regular expressions with the default engine; a pathological pattern
   can block the event loop.
 - Scan coverage counts skipped directories inconsistently, and `$` anchors do not match CRLF files.
-- Completion claims share one pending file per workspace, not one per agent.
 - Prompt-time enrichment includes agent-written text; it is data, but it appears in the prompt.
 - The boundary guard refuses at dispatch time only; redirects and DNS resolution happen afterwards.
 

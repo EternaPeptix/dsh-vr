@@ -1,17 +1,16 @@
 /**
- * Round-trip tests for the state-file format.
+ * Round-trip tests for the Markdown view format.
+ *
+ * The harness no longer reads these files back: the journal is the state. The round trip still
+ * matters to the one program that does read them, the importer, and it is the check that a
+ * generated view shows exactly the record it was generated from.
  *
  * Every bug these cover was invisible to the gate tests because they only ever parsed hand-written
  * fixtures. Rendering a record and parsing it back is the contract that actually matters: if the two
  * disagree, a rewrite silently damages the record.
  */
-import {
-  evaluateGate,
-  evidenceLinks,
-  parseStateFile,
-  renderEvidence,
-  renderThread,
-} from '../lib/rules.js';
+import { evaluateGate, renderEvidence, renderThread } from '../lib/rules.js';
+import { evidenceLinks, parseStateFile } from '../tools/legacy-markdown.mjs';
 
 let failures = 0;
 const check = (name, ok, detail) => {

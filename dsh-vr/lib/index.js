@@ -18,8 +18,9 @@
  *   Revalidation — a finding can become obsolete while you work. Determining that before reporting
  *                  is cheaper than having a maintainer determine it after.
  *
- * State format contract: the workspace file `research/FORMAT.md`. The rules that decide a gate live
- * in `rules.js`, which the read-only view consumes too, so the two cannot disagree.
+ * State lives in `research/journal.jsonl` (lib/journal.js); the Markdown files beside it are
+ * generated views and are never read back. The rules that decide a gate live in `rules.js`, which
+ * the read-only view (tools/vr.mjs) consumes too, so the two cannot disagree.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs, readFileSync } from 'node:fs';
@@ -33,10 +34,8 @@ import {
   THREAD_FRONTMATTER,
   THREAD_SECTIONS,
   evaluateGate,
-  evidenceLinks,
   isFilled,
   missingStageRequirements,
-  parseStateFile,
   fenced,
   fmValue,
   renderEvidence,
@@ -53,9 +52,11 @@ import {
   artifactFingerprintDrift,
   scopeHostEntries,
   scopeHostProblem,
-  pendingRequestedHosts,
-  inertSectionBody,
 } from './rules.js';
+import { evidenceStates } from './evidence.js';
+import { diffRecord, evidenceKey, evidenceOfThread, nextNumbered } from './journal.js';
+import { JOURNAL_FILE, exclusive, openStore } from './store.js';
+import { engagementDoc as engagementDocOf, engagementRecord, threadDoc } from './views.js';
 
 const name = 'dsh-vr';
 
@@ -126,6 +127,11 @@ const Config = z.object({
   requireExecutionAttestation: z.boolean().default(false),
   /** Deferral entries kept in DEFERRALS.md; the oldest are dropped so the file stays readable. */
   deferralsMaxEntries: z.natural().default(200),
+  /**
+   * File holding the secret that journal lines are sealed with. Empty means ~/.dsh-vr/journal.key.
+   * Keep it outside any directory the agent's tools can write to.
+   */
+  journalKeyFile: z.string().default(''),
 });
 
 const IGNORED_DIRS = new Set([
@@ -208,20 +214,53 @@ function compileScanPattern(pattern) {
   return new RegExp(text);
 }
 
-/** Engagement identity from research/ENGAGEMENT.md, or 'unscoped'. */
+/** Where the journal key lives and how many deferrals the generated file shows; set once by apply(). */
+let storeOptions = {};
+const storeAt = (root) => openStore(root, storeOptions);
+
+/**
+ * The journal as the running state-changing tool first read it, per research root. A tool decides
+ * from what it read; if another process has appended since, its write is refused instead of applied
+ * to a state it never saw.
+ */
+const seenStamps = new Map();
+
+async function stateAt(root) {
+  const store = storeAt(root);
+  const state = await store.state();
+  if (!seenStamps.has(root)) seenStamps.set(root, store.lastStamp());
+  return state;
+}
+
+/** The state-changing tool that is running. Such tools run one at a time, so there is only one. */
+let activeTool = '-';
+const by = (exec) => ({
+  session: typeof exec?.agent?.session?.id === 'string' ? exec.agent.session.id : '-',
+  tool: activeTool,
+  call: typeof exec?.callId === 'string' ? exec.callId : undefined,
+});
+
+async function commitAt(root, exec, ops) {
+  const store = storeAt(root);
+  const result = await store.commit(by(exec), ops, seenStamps.get(root));
+  seenStamps.set(root, store.lastStamp());
+  if (result.viewProblem !== undefined) {
+    const record = { ts: nowIso(), event: 'view_error', session: by(exec).session, tool: activeTool, status: 'error', reason: clip(result.viewProblem, 300), args_bytes: 0 };
+    void appendTelemetry(path.join(root, 'telemetry', 'events.jsonl'), record, 8 * 1024 * 1024).catch(() => {});
+  }
+  return result;
+}
+
+/** Engagement identity from the journal, or 'unscoped'. */
 async function readEngagement(root) {
-  const text = await readIfExists(path.join(root, 'ENGAGEMENT.md'));
-  if (text === undefined) return 'unscoped';
-  const parsed = parseStateFile(text);
-  const id = String(parsed.frontmatter.engagement ?? '').trim();
+  const id = String((await stateAt(root)).engagement?.meta?.engagement ?? '').trim();
   return id === '' ? 'unscoped' : id;
 }
 
-/** Parsed ENGAGEMENT.md, or undefined when it is absent. */
 /**
  * The attention ceiling that actually applies.
  *
- * ENGAGEMENT.md carries a `concurrency` field; reading it only in one tool would leave the same
+ * The engagement carries a `concurrency` field; reading it only in one tool would leave the same
  * number meaning different things in different places, so every caller resolves it the same way.
  */
 async function activeCeilingFor(root, config) {
@@ -230,10 +269,32 @@ async function activeCeilingFor(root, config) {
   return Number.isInteger(declared) && declared > 0 ? declared : config.maxActiveThreads;
 }
 
+/** The engagement as `{ frontmatter, sections }`, or undefined before any intake. */
 async function engagementDoc(root) {
-  const text = await readIfExists(path.join(root, 'ENGAGEMENT.md'));
-  if (text === undefined) return undefined;
-  return parseStateFile(text);
+  return engagementDocOf(await stateAt(root));
+}
+
+/**
+ * Record the engagement. A different engagement, or `options.archive`, keeps the one it replaces in
+ * the journal's history instead of editing it into something else.
+ */
+async function saveEngagement(root, fm, sections, exec, options = {}) {
+  const current = (await stateAt(root)).engagement;
+  const next = engagementRecord(fm, sections);
+  const replaces = current !== undefined
+    && (options.archive === true || String(current.meta?.engagement ?? '') !== String(next.meta.engagement ?? ''));
+  // `request`: an object records a pending expansion, null clears it, undefined keeps what is there.
+  if (options.request === undefined) {
+    if (!replaces && current?.request !== undefined) next.request = current.request;
+  } else if (options.request !== null) {
+    next.request = options.request;
+  }
+  if (current === undefined || replaces) {
+    return commitAt(root, exec, [{ kind: 'engagement', put: next, ...(replaces ? { archive: true } : {}) }]);
+  }
+  const delta = diffRecord(current, next);
+  if (delta === undefined) return undefined;
+  return commitAt(root, exec, [{ kind: 'engagement', ...delta }]);
 }
 
 /**
@@ -241,8 +302,14 @@ async function engagementDoc(root) {
  * Every reason is returned so the refusal can say exactly what is missing.
  */
 async function scopeProblems(root) {
-  const doc = await engagementDoc(root);
-  if (doc === undefined) return ['no research/ENGAGEMENT.md exists'];
+  let doc;
+  try {
+    doc = await engagementDoc(root);
+  } catch (error) {
+    // A journal that cannot be believed qualifies nothing.
+    return [error instanceof Error ? error.message : String(error)];
+  }
+  if (doc === undefined) return ['no engagement has been recorded'];
   const fm = doc.frontmatter;
   const problems = [];
   if (String(fm.confirmed ?? '').toLowerCase() !== 'true') {
@@ -264,28 +331,6 @@ async function scopeProblems(root) {
   return problems;
 }
 
-/**
- * The only writer of ENGAGEMENT.md.
- *
- * Every value is made inert here, whatever the caller did to it: this file decides what may be
- * contacted, most of what it stores is text copied off a programme page, and a value that reached
- * it verbatim could carry a line break followed by `confirmed: true` and a closing `---` — a scope
- * that qualified itself with no judge. Frontmatter values are folded to one line; section bodies
- * keep their lines but cannot start a heading, a title or a fence.
- */
-function renderEngagement(fm, sections) {
-  const order = ['engagement', 'programme', 'target', 'revision', 'authorization', 'allowed_hosts', 'concurrency', 'confirmed', 'updated'];
-  const lines = ['---'];
-  for (const key of order) {
-    const value = fmValue(fm[key]);
-    if (value !== '') lines.push(`${key}: ${value}`);
-  }
-  lines.push('---', '');
-  for (const [heading, text] of Object.entries(sections)) {
-    lines.push(`## ${fmValue(heading)}`, '', inertSectionBody(text).trim() || 'none', '');
-  }
-  return `${lines.join('\n').trimEnd()}\n`;
-}
 
 function scopeIntakeBrief(url, host, engagementId) {
   return [
@@ -355,18 +400,19 @@ function scopeJudgeBrief(action, detail) {
   ].join('\n');
 }
 
-/** Hosts the engagement declares as in scope, lower-cased. */
-/** Whether the engagement in this root has been judged and left confirmed true. */
+/**
+ * Whether the engagement has been judged and left confirmed. A journal that fails verification
+ * confirms nothing, so the answer is then "no".
+ */
 async function readEngagementConfirmed(root) {
-  const doc = await engagementDoc(root);
+  const doc = await engagementDoc(root).catch(() => undefined);
   return doc !== undefined && String(doc.frontmatter.confirmed ?? '').toLowerCase() === 'true';
 }
 
+/** Hosts the engagement declares as in scope, lower-cased. */
 async function readAllowedHosts(root) {
-  const text = await readIfExists(path.join(root, 'ENGAGEMENT.md'));
-  if (text === undefined) return [];
-  const parsed = parseStateFile(text);
-  return String(parsed.frontmatter.allowed_hosts ?? '')
+  const doc = await engagementDoc(root).catch(() => undefined);
+  return String(doc?.frontmatter?.allowed_hosts ?? '')
     .split(',')
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
@@ -379,134 +425,83 @@ function hostPermitted(host, allowed, allowLoopback = true) {
 }
 
 async function listThreadIds(root) {
-  const dir = path.join(root, 'threads');
-  let entries;
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') return [];
-    throw error;
-  }
-  return entries
-    .filter((entry) => entry.isDirectory() && /^thr-\d{3,}$/.test(entry.name))
-    .map((entry) => entry.name)
-    .sort();
+  return [...(await stateAt(root)).threads.keys()].sort();
 }
 
+/** Where a thread's generated Markdown is written. Nothing reads it back. */
 const threadDir = (root, id) => path.join(root, 'threads', id);
 
 async function readThread(root, id) {
-  const file = path.join(threadDir(root, id), 'index.md');
-  const text = await readIfExists(file);
-  if (text === undefined) throw new Error(`no such thread: ${id}`);
-  return { file, text, parsed: parseStateFile(text) };
+  const parsed = threadDoc(await stateAt(root), String(id));
+  if (parsed === undefined) throw new Error(`no such thread: ${id}`);
+  return {
+    file: path.join(threadDir(root, String(id)), 'index.md'),
+    text: renderThread(parsed.frontmatter, parsed.sections),
+    parsed,
+  };
 }
 
-/** Read every linked evidence file so the shared rules can judge completeness. */
-async function evidenceStatesFor(root, id, parsed) {
-  const states = [];
-  for (const link of evidenceLinks(parsed.sections)) {
-    const file = path.join(threadDir(root, id), link.path);
-    const text = await readIfExists(file);
-    if (text === undefined) {
-      states.push({ id: link.id, path: link.path, exists: false, complete: false, missingSections: [] });
-      continue;
-    }
-    const evidence = parseStateFile(text);
-    const missingSections = ['Conditions', 'Observed response', 'Target-state check']
-      .filter((section) => !isFilled(evidence.sections[section]));
-    // Byte identity: an artifact cited as evidence must still hash to what the record says.
-    const artifacts = [];
-    for (const line of String(evidence.sections.Artifacts ?? '').split('\n')) {
-      const trimmed = line.trim();
-      const match = /^-\s+(.*?)\s+\(sha256:([0-9a-f]{16,64})/.exec(trimmed);
-      if (match === null) {
-        // An artifact named without a hash cannot be checked for drift. Skipping these silently made
-        // an unverifiable citation indistinguishable from a verified one, so they are kept and the
-        // gate reports them as a caveat instead.
-        const bare = /^-\s+(.+)$/.exec(trimmed);
-        if (bare !== null) {
-          const cited = bare[1].replace(/\s+\((?:not readable|hash unavailable)[^)]*\)\s*$/i, '').trim();
-          if (cited !== '' && cited.toLowerCase() !== 'none') artifacts.push({ path: cited, unhashed: true });
-        }
-        continue;
-      }
-      const [, cited, recorded] = match;
-      let ok;
-      try {
-        const resolved = path.isAbsolute(cited) ? cited : path.resolve(path.dirname(root), cited);
-        const bytes = await fs.readFile(resolved);
-        ok = createHash('sha256').update(bytes).digest('hex').startsWith(recorded);
-      } catch {
-        ok = false;
-      }
-      artifacts.push({ path: cited, ok });
-    }
-    states.push({
-      id: link.id,
-      path: link.path,
-      exists: true,
-      complete: missingSections.length === 0,
-      missingSections,
-      artifacts,
-      // How the claim was established, and how far the harness that established it reaches.
-      kind: String(evidence.frontmatter.kind ?? '').trim().toLowerCase() || undefined,
-      tier: String(evidence.frontmatter.tier ?? '').trim().toLowerCase() || undefined,
-      // Which session wrote the record, so the gate can ask whether anything ran there.
-      session: String(evidence.frontmatter.session ?? '').trim(),
-      created: String(evidence.frontmatter.created ?? '').trim(),
-    });
-  }
-  return states;
-}
+const TERMINAL = new Set(['closed', 'refuted']);
 
-async function regenerateIndex(root) {
-  const ids = await listThreadIds(root);
-  const rows = [];
-  for (const id of ids) {
-    const { parsed } = await readThread(root, id).catch(() => ({ parsed: undefined }));
-    if (parsed === undefined) continue;
-    const fm = parsed.frontmatter;
-    const links = evidenceLinks(parsed.sections);
-    const nextAction = clip(parsed.sections['Next action'] ?? '', 80) || 'none';
-    const question = clip(parsed.sections.Question ?? '', 120).replaceAll('|', '\\|');
-    rows.push(
-      `| ${id} | ${fm.status ?? 'unknown'} | ${fm.stage ?? 'none'} | ${question} | ${links.map((l) => l.id).join(', ') || 'none'} | ${nextAction.replaceAll('|', '\\|')} |`,
+/**
+ * Record what a tool changed on a thread.
+ *
+ * Only the difference from the stored record is written. The Evidence section is not stored at all:
+ * it is the display form of the evidence list, which changes only through `extra.evidence`.
+ */
+async function saveThread(root, id, fm, sections, exec, extra = {}) {
+  const base = (await stateAt(root)).threads.get(id);
+  const wasTerminal = base !== undefined && TERMINAL.has(String(base.meta?.status ?? ''));
+  if (wasTerminal && extra.terminalOk !== true) {
+    throw new Error(
+      `thread ${id} is ${base.meta.status}: terminal threads are immutable. Reopen it with vr_thread_update (status active + reopen_reason), or open a new thread.`,
     );
   }
-  const text = [
-    '# Research threads',
-    '',
-    'Generated by the harness from each `threads/thr-NNN/index.md`. Do not edit by hand.',
-    '',
-    '| id | status | stage | question | evidence | next action |',
-    '|----|--------|-------|----------|----------|-------------|',
-    ...rows,
-    '',
-  ].join('\n');
-  await writeAtomic(path.join(root, 'threads', 'INDEX.md'), text);
-  return ids.length;
+  const meta = {};
+  for (const [key, value] of Object.entries(fm ?? {})) {
+    if (value === undefined || value === null || value === '') continue;
+    meta[key] = String(value);
+  }
+  const body = {};
+  for (const [heading, text] of Object.entries(sections ?? {})) {
+    if (heading === 'Evidence' || text === undefined || text === null) continue;
+    body[heading] = String(text);
+  }
+  if (base?.sections?.Evidence !== undefined) body.Evidence = base.sections.Evidence;
+  const next = { ...(base ?? {}), meta, sections: body, evidence: extra.evidence ?? base?.evidence ?? [] };
+  const ops = [...(extra.also ?? [])];
+  if (base === undefined) {
+    ops.push({ kind: 'thread', id, put: next });
+  } else {
+    const delta = diffRecord(base, next);
+    if (delta !== undefined) ops.push({ kind: 'thread', id, ...delta });
+  }
+  return commitAt(root, exec, ops);
+}
+
+/** The state of every evidence record a thread lists, for the shared rules to judge. */
+async function evidenceStatesFor(root, id, parsed) {
+  return evidenceStates(await stateAt(root), root, id, parsed?.links);
+}
+
+/** Rewrite every generated Markdown file from the journal. */
+async function regenerateIndex(root) {
+  const store = storeAt(root);
+  const state = await store.state();
+  await store.writeViews(state, undefined);
+  return state.threads.size;
 }
 
 async function nextThreadId(root) {
-  const ids = await listThreadIds(root);
-  const highest = ids.reduce((max, id) => Math.max(max, Number.parseInt(id.slice(4), 10) || 0), 0);
-  return `thr-${pad(highest + 1, 3)}`;
+  return nextNumbered('thr-', (await stateAt(root)).threads.keys());
 }
 
-async function nextEvidenceId(dir) {
-  const evidenceDir = path.join(dir, 'evidence');
-  let entries;
-  try {
-    entries = await fs.readdir(evidenceDir);
-  } catch (error) {
-    if (error?.code === 'ENOENT') return 'E-001';
-    throw error;
-  }
-  const highest = entries
-    .filter((file) => /^E-\d+\.md$/.test(file))
-    .reduce((max, file) => Math.max(max, Number.parseInt(file.slice(2), 10) || 0), 0);
-  return `E-${pad(highest + 1, 3)}`;
+async function nextEvidenceId(root, threadId) {
+  const state = await stateAt(root);
+  return nextNumbered('E-', [
+    ...evidenceOfThread(state, threadId).map((record) => record.meta?.id),
+    ...(state.threads.get(threadId)?.evidence ?? []),
+  ]);
 }
 
 function matchesInclude(file, patterns) {
@@ -608,8 +603,16 @@ function toolText(spec) {
     timeoutMs: spec.timeoutMs ?? 15000,
     isConcurrencySafe: spec.concurrencySafe ? () => true : () => false,
     async execute(args, exec) {
+      const call = async () => {
+        if (spec.writesState) {
+          activeTool = spec.name;
+          seenStamps.clear();
+        }
+        return spec.run(args ?? {}, exec);
+      };
       try {
-        return await spec.run(args ?? {}, exec);
+        // A tool that reads the state, decides and then writes must not interleave with another.
+        return await (spec.writesState ? exclusive(call) : call());
       } catch (error) {
         throw new Error(`${spec.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -620,10 +623,11 @@ function toolText(spec) {
 function registerStateTools(ctx, config) {
   ctx.tools.register(toolText({
     name: 'vr_thread_open',
+    writesState: true,
     description: [
       'Open a research thread at stage "candidate": one specific testable claim about one audit target.',
       'Scope is required because a claim about code nobody can reach is not a security claim.',
-      'Writes research/threads/<id>/index.md following research/FORMAT.md and refreshes the index.',
+      'Recorded in the research journal; research/threads/<id>/index.md and the index are generated from it.',
     ].join(' '),
     parameters: {
       question: { type: 'string', required: true, description: 'The specific behaviour under test.' },
@@ -674,7 +678,6 @@ function registerStateTools(ctx, config) {
       }
       const id = await nextThreadId(root);
       const dir = threadDir(root, id);
-      await fs.mkdir(path.join(dir, 'evidence'), { recursive: true });
       const fm = {
         id,
         engagement,
@@ -703,8 +706,7 @@ function registerStateTools(ctx, config) {
         'Next action': clean(args.next_action, 2000),
         Limitations: clean(args.limitations ?? '', 4000) || 'none recorded',
       };
-      await writeAtomic(path.join(dir, 'index.md'), renderThread(fm, sections));
-      await regenerateIndex(root);
+      await saveThread(root, id, fm, sections, exec);
       return [
         `opened ${id} at stage candidate`,
         `path: ${path.join(dir, 'index.md')}`,
@@ -729,7 +731,7 @@ function registerStateTools(ctx, config) {
       let open = 0;
       for (const id of ids) {
         const { parsed } = await readThread(root, id);
-        const links = evidenceLinks(parsed.sections);
+        const { links } = parsed;
         const question = clip(parsed.sections.Question ?? '', 90);
         const status = parsed.frontmatter.status ?? 'unknown';
         const otherEngagement = String(parsed.frontmatter.engagement ?? 'unscoped');
@@ -742,7 +744,7 @@ function registerStateTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_thread_show',
-    description: 'Show one research thread record verbatim (index.md), including stage, assessment, evidence links and next action.',
+    description: 'Show one research thread as recorded, including stage, assessment, evidence links and next action.',
     parameters: {
       thread_id: { type: 'string', required: true, description: 'Thread id such as thr-001.' },
     },
@@ -756,6 +758,7 @@ function registerStateTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_thread_update',
+    writesState: true,
     description: [
       'Update a thread assessment after evidence changes it: status, assessment, next action,',
       'open questions, rejected paths, limitations. Stage is advanced only by vr_stage.',
@@ -797,7 +800,9 @@ function registerStateTools(ctx, config) {
         fm.disposition = '';
         const priorLog = isFilled(sections['Attempt log']) ? sections['Attempt log'] : '';
         // Reopening invalidates the previous readiness claim: stage and revalidation must be re-earned.
-        fm.stage = 'assessed';
+        // It never advances a thread: one closed as a candidate comes back as a candidate.
+        const reached = stageIndex(String(fm.stage ?? ''));
+        fm.stage = STAGES[Math.max(0, Math.min(reached, stageIndex('assessed')))];
         delete fm.reproduces;
         delete fm.revalidated_at;
         delete fm.revalidated_revision;
@@ -845,14 +850,14 @@ function registerStateTools(ctx, config) {
       if (args.limitations !== undefined) sections.Limitations = clean(args.limitations, 8000);
       if (args.reopen_if !== undefined) fm.reopen_if = clean(args.reopen_if, 300);
       fm.updated = nowIso();
-      await writeAtomic(file, renderThread(fm, sections));
-      await regenerateIndex(root);
-      return `updated ${id}: status=${fm.status ?? 'unknown'} stage=${fm.stage ?? 'none'} evidence=${evidenceLinks(sections).length}`;
+      await saveThread(root, id, fm, sections, exec, { terminalOk: wasTerminal });
+      return `updated ${id}: status=${fm.status ?? 'unknown'} stage=${fm.stage ?? 'none'} evidence=${parsed.links.length}`;
     },
   }));
 
   ctx.tools.register(toolText({
     name: 'vr_stage',
+    writesState: true,
     description: [
       'Advance a thread through the research pipeline, or report why it cannot advance.',
       `Stages in order: ${STAGES.join(' -> ')}.`,
@@ -906,8 +911,7 @@ function registerStateTools(ctx, config) {
       // researcher repeat that as separate bookkeeping only invites a gate refusal later.
       if ((fm.status ?? '') === 'untested') fm.status = 'active';
       fm.updated = nowIso();
-      await writeAtomic(file, renderThread(fm, parsed.sections));
-      await regenerateIndex(root);
+      await saveThread(root, id, fm, parsed.sections, exec);
       return [
         `advanced ${id} -> ${requested}`,
         `next: ${STAGES[targetIndex + 1] ?? 'run vr_gate and report it'}`,
@@ -917,6 +921,7 @@ function registerStateTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_attempt',
+    writesState: true,
     description: [
       'Record one attempt against a thread\'s effort budget.',
       'Research that is not converging should stop on evidence rather than on mood:',
@@ -949,8 +954,7 @@ function registerStateTools(ctx, config) {
       }
       const entry = `- attempt ${attempts}: ${args.progress === true ? 'progress' : 'no progress'} — ${noteText}`;
       sections['Attempt log'] = [log, entry].filter(Boolean).join('\n');
-      await writeAtomic(file, renderThread(fm, sections));
-      await regenerateIndex(root);
+      await saveThread(root, id, fm, sections, exec);
       if (attempts >= config.maxAttempts) {
         return [
           `attempt ${attempts}/${config.maxAttempts} recorded on ${id}`,
@@ -965,6 +969,7 @@ function registerStateTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_evidence_add',
+    writesState: true,
     description: [
       'Record ONE atomic check as an evidence file under the thread, with the conditions tested,',
       'the request, the observed response, and the separate target-state check.',
@@ -1008,11 +1013,12 @@ function registerStateTools(ctx, config) {
       const TIERS = ['function', 'component', 'system'];
       if (!KINDS.includes(kind)) throw new Error(`kind must be one of: ${KINDS.join(', ')}`);
       if (!TIERS.includes(tier)) throw new Error(`tier must be one of: ${TIERS.join(', ')}`);
-      const evidenceId = await nextEvidenceId(dir);
+      const evidenceId = await nextEvidenceId(root, id);
       const fmEvidence = {
         id: evidenceId,
         thread: id,
-        title: clean(args.title, 200),
+        // One line: the title is shown in lists and headings, and is not a place for structure.
+        title: fmValue(clean(args.title, 200)),
         target_revision: clean(args.target_revision ?? parsed.frontmatter.target ?? 'unknown', 300),
         configuration: clean(args.configuration ?? 'unspecified', 200),
         kind,
@@ -1022,20 +1028,19 @@ function registerStateTools(ctx, config) {
       };
       // Freeze what is cited: hash the bytes at record time so a later citation cannot silently rot.
       const workspaceBase = path.dirname(root);
-      const artifactLines = [];
+      const artifacts = [];
       for (const raw of Array.isArray(args.artifacts) ? args.artifacts : []) {
-        const value = clean(raw, 500);
-        let note = '';
+        const value = fmValue(clean(raw, 500));
+        if (value === '') continue;
         try {
           const resolved = path.isAbsolute(value) ? value : path.resolve(workspaceBase, value);
           const bytes = await fs.readFile(resolved);
-          note = ` (sha256:${createHash('sha256').update(bytes).digest('hex').slice(0, 16)}…, ${bytes.length} bytes)`;
+          artifacts.push({ path: value, sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length });
         } catch {
-          note = ' (not readable when recorded: hash unavailable)';
+          // Not readable when recorded: kept without a hash, which the gate reports as a caveat.
+          artifacts.push({ path: value, unreadable: true });
         }
-        artifactLines.push(`- ${value}${note}`);
       }
-      const artifactText = artifactLines.join('\n');
       const conditions = Array.isArray(args.conditions) && args.conditions.length > 0
         ? args.conditions.map((c) => `- ${clean(c, 500)}`).join('\n')
         : '';
@@ -1045,10 +1050,19 @@ function registerStateTools(ctx, config) {
         'Observed response': clean(args.observed_response, 8000),
         'Target-state check': clean(args.target_state_check, 8000),
         Limitations: clean(args.limitations ?? '', 4000),
-        Artifacts: artifactText,
       };
       const file = path.join(dir, 'evidence', `${evidenceId}.md`);
-      await writeAtomic(file, renderEvidence(fmEvidence, sections));
+      const record = { meta: fmEvidence, sections, artifacts };
+      if (kind === 'execution') {
+        // Decided now, while the calls that ran are still in the ledger. The ledger rotates, and a
+        // record that could only be attested by re-reading it would lose its support with age.
+        const ledger = await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'));
+        record.attested = executionAttestation(
+          [{ id: evidenceId, exists: true, kind, session: fmEvidence.session, created: fmEvidence.created }],
+          ledger,
+          { executionTools: String(config.executionTools ?? '').split(',').map((tool) => tool.trim()).filter(Boolean) },
+        ).length === 0;
+      }
 
       const fmThread = parsed.frontmatter;
       const bodySections = parsed.sections;
@@ -1058,13 +1072,12 @@ function registerStateTools(ctx, config) {
         if (value === undefined) delete fmThread[key];
         else fmThread[key] = value;
       }
-      const existing = (bodySections.Evidence ?? '').trim();
-      const isEmpty = existing === '' || existing === 'none' || existing === 'none recorded';
-      const bullet = `- [${evidenceId}: ${fmEvidence.title}](evidence/${evidenceId}.md)`;
-      bodySections.Evidence = isEmpty ? bullet : `${existing}\n${bullet}`;
       fmThread.updated = nowIso();
-      await writeAtomic(path.join(dir, 'index.md'), renderThread(fmThread, bodySections));
-      await regenerateIndex(root);
+      // One journal entry holds the record and the link to it: neither can exist without the other.
+      await saveThread(root, id, fmThread, bodySections, exec, {
+        evidence: [...parsed.links.map((link) => link.id), evidenceId],
+        also: [{ kind: 'evidence', thread: id, id: evidenceId, put: record }],
+      });
       return [
         `recorded ${evidenceId} on ${id}`,
         `path: ${file}`,
@@ -1078,6 +1091,7 @@ function registerStateTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_attribution',
+    writesState: true,
     description: [
       'Record why the observed effect is attributed to the claimed mechanism.',
       'A reproduction that succeeds for a different reason than the one you claim is not support',
@@ -1113,8 +1127,7 @@ function registerStateTools(ctx, config) {
           : 'Other explanations tested: none recorded',
       ].join('\n');
       parsed.frontmatter.updated = nowIso();
-      await writeAtomic(file, renderThread(parsed.frontmatter, sections));
-      await regenerateIndex(root);
+      await saveThread(root, id, parsed.frontmatter, sections, exec);
       return [
         `attribution recorded on ${id}`,
         'It states the mechanism, the control change, and the observation after it.',
@@ -1125,6 +1138,7 @@ function registerStateTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_revalidate',
+    writesState: true,
     description: [
       'Re-check a thread against the revision being reported, immediately before reporting.',
       'Code that was vulnerable at scan time can be patched while you work, and a report about',
@@ -1162,8 +1176,7 @@ function registerStateTools(ctx, config) {
         '',
         `Recorded at: ${fm.revalidated_at}`,
       ].join('\n');
-      await writeAtomic(file, renderThread(fm, sections));
-      await regenerateIndex(root);
+      await saveThread(root, id, fm, sections, exec);
       if (args.reproduces !== true) {
         return [
           `revalidation recorded on ${id}: does NOT still reproduce`,
@@ -1176,6 +1189,7 @@ function registerStateTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_evidence_classify',
+    writesState: true,
     description: [
       'Classify how an existing evidence record was established, when it predates the kind/tier fields.',
       'Record classification honestly: execution means you actually ran the target and observed the',
@@ -1198,25 +1212,25 @@ function registerStateTools(ctx, config) {
         throw new Error("tier must be 'function', 'component' or 'system'");
       }
       const { parsed } = await readThread(root, id);
-      const link = evidenceLinks(parsed.sections).find((entry) => entry.id === String(args.evidence_id));
-      if (link === undefined) throw new Error(`${args.evidence_id} is not linked from ${id}`);
-      const file = path.join(threadDir(root, id), link.path);
-      const text = await readIfExists(file);
-      if (text === undefined) throw new Error(`${args.evidence_id} file is missing: ${link.path}`);
-      const evidence = parseStateFile(text);
-      // The heading carries the title; without this the rewrite replaced it with the bare id.
-      if (evidence.title !== undefined) evidence.frontmatter.title = evidence.title;
-      evidence.frontmatter.kind = kind;
-      evidence.frontmatter.tier = tier;
-      if (isFilled(args.note)) {
-        const existing = isFilled(evidence.sections.Limitations) ? evidence.sections.Limitations : '';
-        evidence.sections.Limitations = [
-          existing,
-          `Classification: ${clean(args.note, 500)}`,
-        ].filter(Boolean).join('\n');
+      // Reclassifying a record changes what the thread's closing verdict rested on.
+      if (TERMINAL.has(String(parsed.frontmatter.status))) {
+        throw new Error(
+          `thread ${id} is ${parsed.frontmatter.status}: terminal threads are immutable. Reopen it with vr_thread_update (status active + reopen_reason), or open a new thread.`,
+        );
       }
-      await writeAtomic(file, renderEvidence(evidence.frontmatter, evidence.sections));
-      await regenerateIndex(root);
+      const evidenceId = String(args.evidence_id);
+      if (!parsed.links.some((entry) => entry.id === evidenceId)) throw new Error(`${evidenceId} is not linked from ${id}`);
+      const base = (await stateAt(root)).evidence.get(evidenceKey(id, evidenceId));
+      if (base === undefined) throw new Error(`${evidenceId} is linked from ${id} but no record of it exists`);
+      const next = { ...base, meta: { ...base.meta, kind, tier }, sections: { ...base.sections } };
+      // Attestation was decided for the kind the record had when it was written.
+      if (kind !== String(base.meta?.kind ?? '')) delete next.attested;
+      if (isFilled(args.note)) {
+        const existing = isFilled(next.sections.Limitations) ? next.sections.Limitations : '';
+        next.sections.Limitations = [existing, `Classification: ${clean(args.note, 500)}`].filter(Boolean).join('\n');
+      }
+      const delta = diffRecord(base, next);
+      if (delta !== undefined) await commitAt(root, exec, [{ kind: 'evidence', thread: id, id: evidenceId, ...delta }]);
       return `classified ${args.evidence_id} on ${id}: kind=${kind} tier=${tier}`;
     },
   }));
@@ -1590,6 +1604,7 @@ function registerGoalDiscipline(ctx, config) {
 function registerDeferTool(ctx, config) {
   ctx.tools.register(toolText({
     name: 'vr_defer',
+    writesState: true,
     description: [
       'Record an obstacle without ending the work.',
       'Use this instead of blocking a goal: the blocker becomes durable state that survives the',
@@ -1603,7 +1618,8 @@ function registerDeferTool(ctx, config) {
     },
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
-      const file = path.join(root, 'DEFERRALS.md');
+      // Read first, so the append below is refused if another process wrote in between.
+      await stateAt(root);
       const reason = clean(args.reason, 600);
       if (reason === '') throw new Error('reason must not be empty');
       // A typo in the thread id used to orphan the blocker silently, which is the opposite of what
@@ -1613,35 +1629,21 @@ function registerDeferTool(ctx, config) {
         if (!/^thr-\d+$/.test(threadId)) throw new Error(`thread_id must look like thr-042, got "${threadId}"`);
         await readThread(root, threadId);
       }
-      const line = [
-        `## ${nowIso()}`,
-        '',
-        `- reason: ${reason}`,
-        args.blocked_on ? `- blocked on: ${clean(args.blocked_on, 300)}` : undefined,
-        threadId !== '' ? `- thread: ${threadId}` : undefined,
-        args.next_action ? `- next action: ${clean(args.next_action, 300)}` : undefined,
-        `- session: ${typeof exec?.agent?.id === 'string' ? exec.agent.id : '-'}`,
-        '',
-      ].filter((part) => part !== undefined).join('\n');
-
-      const existing = await readIfExists(file);
-      // Entries are kept as one list so the cap drops the oldest rather than refusing new work.
-      const previousEntries = existing === undefined
-        ? []
-        : existing.split(/^(?=## )/m).filter((part) => part.startsWith('## '));
-      const entries = [...previousEntries, line];
-      const dropped = Math.max(0, entries.length - config.deferralsMaxEntries);
-      const kept = entries.slice(dropped);
-      const note = dropped > 0
-        ? `\n(${dropped} older entr${dropped === 1 ? 'y' : 'ies'} dropped at the ${config.deferralsMaxEntries}-entry cap.)\n`
-        : '';
-      await writeAtomic(
-        file,
-        `# Deferrals\n\nObstacles recorded instead of ending a goal. Newest last.\n${note}\n${kept.join('\n')}`,
-      );
+      // Every entry stays in the journal; the generated file shows the newest deferralsMaxEntries.
+      await commitAt(root, exec, [{
+        kind: 'deferral',
+        add: {
+          at: nowIso(),
+          reason,
+          blocked_on: args.blocked_on ? clean(args.blocked_on, 300) : undefined,
+          thread: threadId !== '' ? threadId : undefined,
+          next_action: args.next_action ? clean(args.next_action, 300) : undefined,
+          session: typeof exec?.agent?.id === 'string' ? exec.agent.id : '-',
+        },
+      }]);
 
       return [
-        'recorded in research/DEFERRALS.md.',
+        'recorded (shown in research/DEFERRALS.md).',
         '',
         'Your goal stays active. Continue with the most useful unblocked step now.',
         'If what you need is a decision from the operator, call ask_operator so the question is asked',
@@ -1800,10 +1802,11 @@ function registerContextTool(ctx, config) {
  * reopens instead of ending.
  */
 function registerFinishTool(ctx, config) {
-  const pendingFile = (root) => path.join(root, 'COMPLETION-PENDING.json');
+  const discard = (root, exec, key) => commitAt(root, exec, [{ kind: 'completion', key, put: null }]);
 
   ctx.tools.register(toolText({
     name: 'vr_finish_goal',
+    writesState: true,
     description: [
       'Claim that the goal is finished, without completing it.',
       'Records the claim, checks that the named artifacts exist, and returns a brief for an',
@@ -1850,9 +1853,12 @@ function registerFinishTool(ctx, config) {
         ? `${item.name} (gate ${item.gate})`
         : item.name));
 
-      await writeAtomic(
-        pendingFile(root),
-        JSON.stringify({
+      // One pending claim per goal: a claim for another goal is neither overwritten nor mistaken
+      // for this one.
+      await commitAt(root, exec, [{
+        kind: 'completion',
+        key: String(view.id),
+        put: {
           goalId: String(view.id),
           claimedBy: typeof exec?.agent?.id === 'string' ? exec.agent.id : 'unknown',
           objective: String(view.objective ?? ''),
@@ -1861,8 +1867,8 @@ function registerFinishTool(ctx, config) {
           verified,
           fingerprints,
           created: nowIso(),
-        }, null, 2),
-      );
+        },
+      }]);
 
       return [
         'completion claimed, not granted. The goal stays active until a verifier approves it.',
@@ -1892,6 +1898,7 @@ function registerFinishTool(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_completion_decide',
+    writesState: true,
     description: [
       'Record the verifier verdict on a claimed completion.',
       'APPROVE completes the goal. REJECT leaves it active, so the work reopens rather than ending.',
@@ -1907,16 +1914,19 @@ function registerFinishTool(ctx, config) {
       const agent = exec.agent;
       if (agent === undefined) throw new Error('no agent bound to this call');
       const root = await researchRoot(ctx, config, exec);
-      const file = pendingFile(root);
-      const text = await readIfExists(file);
-      if (text === undefined) throw new Error('there is no pending completion claim; call vr_finish_goal first');
-
-      let claim;
-      try {
-        claim = JSON.parse(text);
-      } catch {
-        throw new Error('the pending completion claim is unreadable; re-run vr_finish_goal');
+      const pending = (await stateAt(root)).completions;
+      const current = goals.get(agent);
+      // The claim for the goal this agent holds; failing that, the only claim there is, so that a
+      // claim left behind by a goal that has since gone can still be rejected or discarded.
+      const key = current !== undefined && pending.has(String(current.id))
+        ? String(current.id)
+        : (pending.size === 1 ? [...pending.keys()][0] : undefined);
+      if (key === undefined) {
+        throw new Error(pending.size === 0
+          ? 'there is no pending completion claim; call vr_finish_goal first'
+          : 'there is no pending completion claim for the current goal; call vr_finish_goal first');
       }
+      const claim = pending.get(key);
 
       const approved = args.approved === true;
       const rationale = clean(args.rationale, 600);
@@ -1926,7 +1936,7 @@ function registerFinishTool(ctx, config) {
       const selfVerified = claimedBy !== 'unknown' && claimedBy === decidedBy;
 
       if (!approved) {
-        await fs.rm(file, { force: true });
+        await discard(root, exec, key);
         return [
           `completion REJECTED: ${rationale}`,
           '',
@@ -1942,22 +1952,22 @@ function registerFinishTool(ctx, config) {
         maxAgeMs: config.completionClaimMinutes * 60000,
       });
       if (problem !== undefined) {
-        await fs.rm(file, { force: true });
+        await discard(root, exec, key);
         throw new Error(`refusing this verdict: ${problem}. The stale claim has been discarded — call vr_finish_goal again if the goal is genuinely finished.`);
       }
       if (!Array.isArray(claim.fingerprints)) {
-        await fs.rm(file, { force: true });
+        await discard(root, exec, key);
         throw new Error('refusing this verdict: the claim records no artifact fingerprints, so nothing says the files still hold what the verifier read. Call vr_finish_goal again.');
       }
       const artifactNames = (Array.isArray(claim.artifacts) ? claim.artifacts : []).map((item) => String(item)).filter(Boolean);
       const rechecked = await fingerprintArtifacts(root, sessionBase(ctx, exec), artifactNames, config);
       const drift = artifactFingerprintDrift(claim.fingerprints, rechecked.fingerprints);
       if (drift.length > 0) {
-        await fs.rm(file, { force: true });
+        await discard(root, exec, key);
         throw new Error(`refusing this verdict: ${drift.join('; ')}. The claim has been discarded — re-check the artifacts and claim again.`);
       }
       const completed = goals.complete(agent, { id: view.id, revision: view.revision });
-      await fs.rm(file, { force: true });
+      await discard(root, exec, key);
       return [
         `goal completed after independent verification: ${claim.summary}`,
         `verified: ${(claim.verified ?? []).join(', ')}`,
@@ -1978,7 +1988,9 @@ function registerScopeTools(ctx, config) {
     async run(_args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const problems = await scopeProblems(root);
-      const doc = await engagementDoc(root);
+      // A journal that cannot be believed is a status to report, not a crash: the reason is already
+      // among the problems, and nothing from it is shown as if it were the scope.
+      const doc = await engagementDoc(root).catch(() => undefined);
       const fm = doc?.frontmatter ?? {};
       return [
         problems.length === 0 ? 'scope: QUALIFIED' : 'scope: NOT QUALIFIED',
@@ -1995,14 +2007,15 @@ function registerScopeTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_scope_intake',
+    writesState: true,
     description: [
       'Begin a scope intake from a programme URL.',
-      'Writes a provisional ENGAGEMENT.md that permits only the programme host, leaves confirmed',
+      'Records a provisional engagement that permits only the programme host, leaves confirmed',
       'false, and returns the brief for the scope-intake worker.',
     ].join(' '),
     parameters: {
       url: { type: 'string', required: true, description: 'The programme or scope-page URL.' },
-      force: { type: 'boolean', description: 'Archive a qualified ENGAGEMENT.md and start again. Refused without it.' },
+      force: { type: 'boolean', description: 'Set aside a qualified engagement and start again; the journal keeps the old one. Refused without it.' },
     },
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
@@ -2034,18 +2047,15 @@ function registerScopeTools(ctx, config) {
         throw new Error(
           `refusing intake: ${String(existing.frontmatter.engagement ?? engagementId)} is already qualified (confirmed: true). `
           + 'Overwriting it would destroy the scope that was judged and the decisions recorded against it. '
-          + 'Pass force: true to archive the existing file first and start a new intake.',
+          + 'Pass force: true to archive the existing engagement first and start a new intake.',
         );
-      }
-      if (alreadyQualified) {
-        const stamp = nowIso().replace(/[:.]/g, '-');
-        const previousText = await fs.readFile(path.join(root, 'ENGAGEMENT.md'), 'utf8');
-        await writeAtomic(path.join(root, `ENGAGEMENT.${stamp}.md`), previousText);
       }
 
       const fm = {
         engagement: engagementId,
         programme: url,
+        // Kept apart from `programme`, which the intake worker replaces with the programme's name.
+        programme_url: url,
         target: host,
         authorization: 'PENDING',
         allowed_hosts: host,
@@ -2062,7 +2072,8 @@ function registerScopeTools(ctx, config) {
         Policy: 'Unknown until intake completes.',
         'Scope decisions': `- ${nowIso()} intake started from ${url}`,
       };
-      await writeAtomic(path.join(root, 'ENGAGEMENT.md'), renderEngagement(fm, sections));
+      // A judged engagement is kept in the journal's history, and as a dated file, before it is replaced.
+      await saveEngagement(root, fm, sections, exec, { archive: alreadyQualified, request: null });
       noteScope(ctx, config, exec, root, 'vr_scope_intake', 'provisional', engagementId);
       return [
         `wrote provisional scope for ${engagementId} (confirmed: false)`,
@@ -2076,6 +2087,7 @@ function registerScopeTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_scope_apply',
+    writesState: true,
     description: [
       'Record the scope a programme review found.',
       'Still leaves confirmed false: the scope must pass an independent judge before work starts.',
@@ -2118,6 +2130,14 @@ function registerScopeTools(ctx, config) {
         confirmed: 'false',
         updated: nowIso().slice(0, 10),
       };
+      // The page the scope was read from stays on the record, so the judge can still fetch it once
+      // `programme` holds a name. Only for the engagement the intake was started for.
+      const intakeUrl = String(doc0?.frontmatter?.programme_url ?? '');
+      if (intakeUrl !== '' && String(doc0.frontmatter.engagement ?? '') === fm.engagement) {
+        fm.programme_url = intakeUrl;
+      } else if (/^https?:\/\/\S+$/i.test(fm.programme)) {
+        fm.programme_url = fm.programme;
+      }
       const sections = {
         'In scope': hosts.map((host) => `- ${host}`).join('\n'),
         // One rule per list item: a rule that spans lines would read as several entries nobody passed.
@@ -2140,7 +2160,12 @@ function registerScopeTools(ctx, config) {
         noteScope(ctx, config, exec, root, 'vr_scope_apply', 'unchanged', `${fm.engagement} hosts=${fm.allowed_hosts}`);
         return `unchanged since last apply for ${fm.engagement}: the scope is identical, so the judge was not re-run.\nIf you expected a change, the values you passed match what is already recorded.`;
       }
-      await writeAtomic(path.join(root, 'ENGAGEMENT.md'), renderEngagement(fm, sections));
+      // Recording a scope over one that was judged replaces what the judge approved, so the judged
+      // record is archived rather than edited into something nobody judged.
+      await saveEngagement(root, fm, sections, exec, {
+        archive: previous !== undefined && String(previous.frontmatter.confirmed ?? '').toLowerCase() === 'true',
+        request: null,
+      });
       noteScope(ctx, config, exec, root, 'vr_scope_apply', 'recorded', `${fm.engagement} hosts=${fm.allowed_hosts}`);
       return [
         `scope recorded for ${fm.engagement} (confirmed: false)`,
@@ -2168,6 +2193,7 @@ function registerScopeTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_scope_decide',
+    writesState: true,
     description: [
       'Record the judge verdict on the current scope.',
       'Approval is the only thing that sets confirmed true and lets work begin.',
@@ -2192,20 +2218,21 @@ function registerScopeTools(ctx, config) {
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const doc = await engagementDoc(root);
-      if (doc === undefined) throw new Error('no ENGAGEMENT.md to decide on');
+      if (doc === undefined) throw new Error('no engagement has been recorded to decide on');
       const fm = doc.frontmatter;
       const sections = doc.sections ?? {};
       const approved = args.approved === true;
-      const pending = String(sections['Pending scope request'] ?? '');
       // A pending request means this verdict closes an expansion, not the engagement's scope.
       // Rejecting an expansion must leave the existing qualification exactly as it was.
-      const isExpansion = pending.trim() !== '';
+      const isExpansion = doc.request !== undefined && doc.request !== null;
       // Comparisons use normalised hostnames; what is written back keeps the entries as recorded, so
       // an approval cannot quietly rewrite a scoped port or a wildcard into its bare domain.
       const existingRaw = String(fm.allowed_hosts ?? '').split(',').map((host) => host.trim()).filter(Boolean);
-      // Read from the request's own leading lines only: the free text below them quotes the
-      // programme page, and a host line found there was never shown to the judge as requested.
-      const requestedRaw = isExpansion ? pendingRequestedHosts(pending) : [];
+      // The hosts the request recorded, as data. The free text of a request quotes the programme
+      // page, and nothing in it can add a host.
+      const requestedRaw = isExpansion
+        ? (Array.isArray(doc.request.hosts) ? doc.request.hosts : []).map((host) => String(host))
+        : [];
       const existingHosts = existingRaw.map(normaliseHost).filter(Boolean);
       const requestedHosts = requestedRaw.map(normaliseHost).filter(Boolean);
       const prospectiveHosts = [...new Set([...existingHosts, ...requestedHosts])];
@@ -2228,7 +2255,7 @@ function registerScopeTools(ctx, config) {
         if (requestedRaw.length === 0 || unreadable.length > 0) {
           throw new Error([
             requestedRaw.length === 0
-              ? 'refusing to approve: the pending request names no host on its leading "requested host:" lines.'
+              ? 'refusing to approve: the pending request names no host.'
               : `refusing to approve: the pending request names ${unreadable.join('; ')}.`,
             'Reject it (approved: false) to clear it, then file the request again with vr_scope_request.',
           ].join(' '));
@@ -2275,12 +2302,9 @@ function registerScopeTools(ctx, config) {
           });
           fm.allowed_hosts = [...existingRaw, ...appended].join(', ');
         }
-        if (isExpansion) delete sections['Pending scope request'];
         // An approved expansion merges hosts; it does not qualify the engagement.
-        else fm.confirmed = 'true';
-      } else if (isExpansion) {
-        delete sections['Pending scope request'];
-      } else {
+        if (!isExpansion) fm.confirmed = 'true';
+      } else if (!isExpansion) {
         fm.confirmed = 'false';
       }
       fm.updated = nowIso().slice(0, 10);
@@ -2300,7 +2324,8 @@ function registerScopeTools(ctx, config) {
           ? `  not tested although the page lists them: ${narrowed.join(', ')}`
           : '',
       ].filter(Boolean).join('\n');
-      await writeAtomic(path.join(root, 'ENGAGEMENT.md'), renderEngagement(fm, sections));
+      // Either verdict closes a pending request.
+      await saveEngagement(root, fm, sections, exec, { request: null });
       noteScope(ctx, config, exec, root, 'vr_scope_decide', approved ? 'approved' : 'rejected', `${fm.engagement}: ${clean(args.rationale, 200)}`);
       return approved
         ? `scope QUALIFIED for ${fm.engagement}: confirmed true, allowed_hosts ${fm.allowed_hosts}\nWork may begin.`
@@ -2310,6 +2335,7 @@ function registerScopeTools(ctx, config) {
 
   ctx.tools.register(toolText({
     name: 'vr_scope_request',
+    writesState: true,
     description: [
       'Request an expansion of the current scope.',
       'The requester must explain what work is blocked, why the host is genuinely in scope, what',
@@ -2326,7 +2352,7 @@ function registerScopeTools(ctx, config) {
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const doc = await engagementDoc(root);
-      if (doc === undefined) throw new Error('no ENGAGEMENT.md exists');
+      if (doc === undefined) throw new Error('no engagement has been recorded; start with vr_scope_intake');
       const { hosts, problems: hostProblems } = scopeHostEntries(args.requested_hosts);
       if (hostProblems.length > 0) {
         throw new Error([
@@ -2337,21 +2363,18 @@ function registerScopeTools(ctx, config) {
       if (hosts.length === 0) throw new Error('requested_hosts must name at least one host');
       const fm = doc.frontmatter;
       const sections = doc.sections ?? {};
-      sections['Pending scope request'] = [
-        ...hosts.map((host) => `requested host: ${host}`),
-        '',
-        `Blocked work: ${clean(args.blocked_work, 1000)}`,
-        '',
-        `Justification: ${clean(args.justification, 2000)}`,
-        '',
-        `Evidence: ${clean(args.evidence, 2000)}`,
-        '',
-        `Risk if wrong: ${clean(args.risk, 1000)}`,
-        '',
-        `Requested at: ${nowIso()}`,
-      ].join('\n');
       fm.updated = nowIso().slice(0, 10);
-      await writeAtomic(path.join(root, 'ENGAGEMENT.md'), renderEngagement(fm, sections));
+      // Kept as data: the judge is shown these hosts, and an approval merges exactly these hosts.
+      await saveEngagement(root, fm, sections, exec, {
+        request: {
+          hosts,
+          blocked_work: clean(args.blocked_work, 1000),
+          justification: clean(args.justification, 2000),
+          evidence: clean(args.evidence, 2000),
+          risk: clean(args.risk, 1000),
+          at: nowIso(),
+        },
+      });
       return [
         `scope expansion requested for: ${hosts.join(', ')}`,
         '',
@@ -2741,6 +2764,7 @@ function registerBoundaryGuard(ctx, config) {
       contacted = [];
     }
     let outOfScope;
+    let scopeUnreadable;
     if (config.enforceAllowedHosts) {
       try {
         const allowed = await readAllowedHosts(await researchRoot(ctx, config, exec));
@@ -2756,7 +2780,8 @@ function registerBoundaryGuard(ctx, config) {
         // stays reachable through the fetch tool even while every other host is refused.
         const programmeHost = (() => {
           try {
-            return new URL(String(scopeDoc?.frontmatter?.programme ?? '')).hostname.toLowerCase();
+            const page = scopeDoc?.frontmatter?.programme_url ?? scopeDoc?.frontmatter?.programme;
+            return new URL(String(page ?? '')).hostname.toLowerCase();
           } catch {
             return undefined;
           }
@@ -2765,16 +2790,21 @@ function registerBoundaryGuard(ctx, config) {
         // fetch tool, because a GET for documentation cannot act on the host the way a shell
         // command can. Treating it as scope for bash let any configured host be contacted.
         const referenceApplies = name === 'web_fetch';
+        // An unjudged scope is not a scope: until a judge confirms it, the hosts it lists are only a
+        // proposal. They used to be permitted the moment vr_scope_apply recorded them, which let an
+        // agent name any host and contact it without a judge ever seeing the list.
+        const judged = qualified ? allowed : [];
         outOfScope = contacted.find((host) => {
-          if (hostPermitted(host, allowed, config.allowLoopback)) return false;
+          if (hostPermitted(host, judged, config.allowLoopback)) return false;
           if (referenceApplies && hostPermitted(host, reference, false)) return false;
           if (referenceApplies && programmeHost !== undefined && host === programmeHost) return false;
-          // Fail closed: an empty allowlist used to mean "everything is permitted", and an unjudged
-          // scope is not a scope.
-          return !qualified || allowed.length === 0 || true;
+          return true;
         });
-      } catch {
-        outOfScope = undefined;
+      } catch (error) {
+        // A scope that cannot be read permits nothing. This used to clear the finding instead, so a
+        // journal that failed verification let every host through.
+        scopeUnreadable = error instanceof Error ? error.message : String(error);
+        outOfScope = contacted.find((host) => !hostPermitted(host, [], config.allowLoopback));
       }
     }
     const match = deniedHostMatch(contacted, hosts);
@@ -2798,14 +2828,22 @@ function registerBoundaryGuard(ctx, config) {
         }
       })();
     };
+    if (outOfScope !== undefined && scopeUnreadable !== undefined) {
+      audit('deny', { reason: `scope-unreadable:${outOfScope}` });
+      return {
+        kind: 'deny',
+        reason: `Blocked by the host guard: the engagement scope cannot be read, so no host is permitted, "${outOfScope}" included. ${clip(scopeUnreadable, 400)}`,
+      };
+    }
     if (outOfScope !== undefined) {
       audit('deny', { reason: `out-of-scope:${outOfScope}` });
       return {
         kind: 'deny',
         reason: [
-          `Blocked by the host guard (best-effort matching, not a sandbox): "${outOfScope}" is not in allowed_hosts of`,
-          'research/ENGAGEMENT.md. Add it there if it is genuinely in scope, otherwise test the',
-          'local instance instead.',
+          `Blocked by the host guard (best-effort matching, not a sandbox): "${outOfScope}" is not one of the`,
+          "engagement's allowed hosts. If the programme page lists it, call vr_scope_request so a judge can",
+          'add it; editing research/ENGAGEMENT.md changes nothing, because that file is generated.',
+          'Otherwise test the local instance instead.',
         ].join(' '),
       };
     }
@@ -2866,7 +2904,7 @@ function registerStateEnrichment(ctx, config) {
       let engagement;
       for (const candidate of stateRoots) {
         try {
-          await fs.access(path.join(candidate, 'threads'));
+          await fs.access(path.join(candidate, JOURNAL_FILE));
           root = candidate;
           engagement = await readEngagement(candidate);
           break;
@@ -2876,7 +2914,7 @@ function registerStateEnrichment(ctx, config) {
       }
       if (root === undefined) {
         void note('context_miss', {
-          reason: 'no threads directory under any configured root',
+          reason: 'no readable research journal under any configured root',
           detail: clip(stateRoots.join(' | '), 300),
         });
         return out;
@@ -2897,8 +2935,8 @@ function registerStateEnrichment(ctx, config) {
           open: status === 'active' || status === 'untested',
           updated: String(fm.updated ?? fm.created ?? ''),
           question: clip(parsed.sections.Question ?? '', 90),
-          nextAction: clip(parsed.sections['Next action'] ?? '', 60),
-          evidence: evidenceLinks(parsed.sections).map((link) => link.id).join(',') || 'none',
+          nextAction: clip(parsed.sections['Next action'] ?? '', 60) || 'none',
+          evidence: parsed.links.map((link) => link.id).join(',') || 'none',
         });
       }
       if (rows.length === 0) return out;
@@ -2964,9 +3002,9 @@ async function buildDashboardState(ctx, config) {
       disposition: String(fm.disposition ?? ''),
       attempts: Number.parseInt(fm.attempts ?? '0', 10) || 0,
       question: clip(parsed.sections.Question ?? '', 140),
-      nextAction: clip(parsed.sections['Next action'] ?? '', 80),
+      nextAction: clip(parsed.sections['Next action'] ?? '', 80) || 'none',
       reopenIf: clip(fm.reopen_if ?? '', 120),
-      evidence: evidenceLinks(parsed.sections).map((link) => link.id),
+      evidence: parsed.links.map((link) => link.id),
       executed: gate.executedCount ?? 0,
       gate: gate.decision,
       reasons: gate.reasons.map((reason) => ({ code: gateCode(reason), text: clip(reason, 160) })),
@@ -2978,30 +3016,17 @@ async function buildDashboardState(ctx, config) {
     if (thread.gate !== 'HOLD') continue;
     for (const reason of thread.reasons) codeCounts[reason.code] = (codeCounts[reason.code] ?? 0) + 1;
   }
-  // Integrity view: evidence files that exist but are not linked from any thread index.
+  // Integrity view: evidence records that no thread lists.
   const linked = new Set();
   for (const thread of threads) {
     for (const evidenceId of thread.evidence) linked.add(`${thread.id}/${evidenceId}`);
   }
-  const orphans = [];
-  for (const id of ids) {
-    const dir = path.join(root, 'threads', id, 'evidence');
-    let files;
-    try {
-      files = await fs.readdir(dir);
-    } catch {
-      continue;
-    }
-    for (const file of files) {
-      if (!/^E-\d+\.md$/.test(file)) continue;
-      const evidenceId = file.replace('.md', '');
-      if (!linked.has(`${id}/${evidenceId}`)) orphans.push(`${id}/${evidenceId}`);
-    }
-  }
+  const orphans = [...(await stateAt(root)).evidence.keys()].filter((key) => !linked.has(key)).sort();
   return {
     engagement,
     open,
-    ceiling: config.maxActiveThreads,
+    // The engagement's own limit when it declares one: the number the tools enforce.
+    ceiling: await activeCeilingFor(root, config),
     generatedAt: nowIso(),
     counts: {
       total: threads.length,
@@ -3129,10 +3154,11 @@ async function fingerprintArtifacts(root, base, artifacts, config) {
 function registerRepairTool(ctx, config) {
   ctx.tools.register(toolText({
     name: 'vr_repair',
+    writesState: true,
     description: [
-      'Report and repair record inconsistencies: evidence files not linked from their thread, and',
-      'links that point at files that do not exist. A dry run unless apply is true.',
-      'Terminal threads are reported, never rewritten.',
+      'Report and repair record inconsistencies: evidence records that their thread does not list, and',
+      'listed evidence ids that have no record. A dry run unless apply is true, which also rewrites',
+      'every generated Markdown file from the journal. Terminal threads are reported, never changed.',
     ].join(' '),
     parameters: {
       apply: { type: 'boolean', description: 'Write the repairs. Omit for a dry run that only reports.' },
@@ -3140,61 +3166,57 @@ function registerRepairTool(ctx, config) {
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const apply = args.apply === true;
+      const state = await stateAt(root);
       const repaired = [];
       const report = [];
-      for (const id of await listThreadIds(root)) {
-        // eslint-disable-next-line no-await-in-loop
-        const { parsed } = await readThread(root, id).catch(() => ({ parsed: undefined }));
-        if (parsed === undefined) continue;
-        const dir = threadDir(root, id);
-        const status = String(parsed.frontmatter.status ?? '');
-        const terminal = status === 'closed' || status === 'refuted';
-        const links = evidenceLinks(parsed.sections);
-        const linked = new Set(links.map((link) => link.path));
-        // eslint-disable-next-line no-await-in-loop
-        const files = (await fs.readdir(path.join(dir, 'evidence')).catch(() => []))
-          .filter((file) => /^E-\d+\.md$/.test(file))
-          .sort();
-        const unlinked = files.filter((file) => !linked.has(`evidence/${file}`));
-        const missing = [];
-        for (const link of links) {
-          // eslint-disable-next-line no-await-in-loop
-          const exists = await fs.access(path.join(dir, link.path)).then(() => true).catch(() => false);
-          if (!exists) missing.push(`${link.id} -> ${link.path}`);
-        }
+      const ops = [];
+      for (const id of [...state.threads.keys()].sort()) {
+        const thread = state.threads.get(id);
+        const status = String(thread.meta?.status ?? '');
+        const listed = Array.isArray(thread.evidence) ? thread.evidence : [];
+        const missing = listed.filter((evidenceId) => !state.evidence.has(evidenceKey(id, evidenceId)));
         if (missing.length > 0) {
-          report.push(`${id}: ${missing.length} link(s) point at files that do not exist: ${missing.join(', ')}`);
+          report.push(`${id}: ${missing.length} listed evidence id(s) have no record: ${missing.join(', ')}`);
         }
+        const unlinked = evidenceOfThread(state, id)
+          .map((record) => String(record.meta?.id))
+          .filter((evidenceId) => !listed.includes(evidenceId));
         if (unlinked.length === 0) continue;
-        if (terminal) {
-          report.push(`${id}: ${unlinked.length} unlinked evidence file(s), left alone because the thread is ${status}: ${unlinked.join(', ')}`);
+        if (TERMINAL.has(status)) {
+          report.push(`${id}: ${unlinked.length} unlinked evidence record(s), left alone because the thread is ${status}: ${unlinked.join(', ')}`);
           continue;
         }
-        const bullets = [];
-        for (const file of unlinked) {
-          // eslint-disable-next-line no-await-in-loop
-          const text = await readIfExists(path.join(dir, 'evidence', file));
-          const evidence = text === undefined ? undefined : parseStateFile(text);
-          const evidenceId = file.replace(/\.md$/, '');
-          const title = String(evidence?.title ?? evidenceId);
-          bullets.push(`- [${evidenceId}: ${clip(title, 120)}](evidence/${file})`);
-        }
         if (apply) {
-          const existing = String(parsed.sections.Evidence ?? '').trim();
-          const isEmpty = existing === '' || existing === 'none';
-          parsed.sections.Evidence = isEmpty ? bullets.join('\n') : `${existing}\n${bullets.join('\n')}`;
-          // eslint-disable-next-line no-await-in-loop
-          await writeAtomic(path.join(dir, 'index.md'), renderThread(parsed.frontmatter, parsed.sections));
+          // Linking a record changes the evidence set, exactly as recording one does.
+          const meta = { ...thread.meta };
+          for (const [key, value] of Object.entries(readinessInvalidatedBy(meta).changes)) {
+            if (value === undefined) delete meta[key];
+            else meta[key] = value;
+          }
+          const delta = diffRecord(thread, { ...thread, meta, evidence: [...listed, ...unlinked] });
+          if (delta !== undefined) ops.push({ kind: 'thread', id, ...delta });
         }
-        repaired.push(`${id}: ${bullets.length} evidence file(s) ${apply ? 'linked' : 'would be linked'}: ${unlinked.join(', ')}`);
+        repaired.push(`${id}: ${unlinked.length} evidence record(s) ${apply ? 'linked' : 'would be linked'}: ${unlinked.join(', ')}`);
       }
-      if (apply && repaired.length > 0) await regenerateIndex(root);
-      if (repaired.length === 0 && report.length === 0) return 'no inconsistencies found between threads and their evidence files.';
+      for (const key of state.evidence.keys()) {
+        if (!state.threads.has(key.split('/')[0])) report.push(`${key}: recorded for a thread that does not exist`);
+      }
+      if (apply) {
+        if (ops.length > 0) await commitAt(root, exec, ops);
+        // The Markdown under research/ is generated. Rewriting all of it also undoes any hand edit.
+        const problem = await storeAt(root).writeViews(await stateAt(root), undefined);
+        if (problem !== undefined) report.push(problem);
+      }
+      if (repaired.length === 0 && report.length === 0) {
+        return apply
+          ? 'no inconsistencies found between threads and their evidence records. The Markdown views were rewritten from the journal.'
+          : 'no inconsistencies found between threads and their evidence records.';
+      }
       return [
         ...repaired,
         ...report,
         '',
-        apply ? 'Repairs written; INDEX.md regenerated.' : 'Dry run only. Call again with apply: true to write these repairs.',
+        apply ? 'Repairs recorded; the Markdown views were rewritten from the journal.' : 'Dry run only. Call again with apply: true to write these repairs.',
         report.length > 0 ? 'Items in the report list need a decision, not a rewrite.' : '',
       ].filter(Boolean).join('\n');
     },
@@ -3217,9 +3239,15 @@ function gateOptions(config) {
  */
 async function gateFor(root, parsed, evidenceStates, config, ledger) {
   const gate = evaluateGate(parsed, evidenceStates, gateOptions(config));
-  const events = ledger === undefined
-    ? await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'))
-    : ledger;
+  // A record carries the answer decided when it was written; the ledger is consulted only for
+  // records that predate that.
+  const undecided = evidenceStates.some((state) => state.exists && state.kind === 'execution' && state.attested === undefined);
+  let events = [];
+  if (undecided) {
+    events = ledger === undefined
+      ? await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'))
+      : ledger;
+  }
   const unattested = executionAttestation(evidenceStates, events, {
     executionTools: String(config.executionTools ?? '').split(',').map((tool) => tool.trim()).filter(Boolean),
   });
@@ -3233,6 +3261,13 @@ async function gateFor(root, parsed, evidenceStates, config, ledger) {
 
 function apply(ctx, config) {
   if (!config.enabled) return;
+  storeOptions = {
+    keyFile: String(config.journalKeyFile ?? '').trim() === '' ? undefined : path.resolve(String(config.journalKeyFile).trim()),
+    // Read when a view is written, so the number in force is the configured one.
+    get deferralsMaxEntries() {
+      return config.deferralsMaxEntries;
+    },
+  };
   registerStateTools(ctx, config);
   registerScanTool(ctx, config);
   registerScanEvalTool(ctx, config);

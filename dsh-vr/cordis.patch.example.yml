@@ -12,6 +12,9 @@
         enrich: true
         # Absolute path to this workspace's research directory.
         enrichRoot: "/absolute/path/to/your/research"
+        # The key that seals research/journal.jsonl. Empty means ~/.dsh-vr/journal.key, created on the
+        # first write. Keep it outside the workspace, and back it up with the journal.
+        journalKeyFile: ""
         deniedHosts: "vendor-a.example,vendor-b.example"
         enforceAllowedHosts: true
         referenceHosts: ""

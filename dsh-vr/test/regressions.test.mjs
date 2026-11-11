@@ -19,13 +19,12 @@ import {
   hostGrounded,
   inertSectionBody,
   normaliseHost,
-  parseStateFile,
-  pendingRequestedHosts,
   readinessInvalidatedBy,
   renderThread,
   scopeHostEntries,
   scopeHostProblem,
 } from '../lib/rules.js';
+import { parseStateFile, pendingRequestedHosts } from '../tools/legacy-markdown.mjs';
 
 let failures = 0;
 const check = (name, ok, detail) => {

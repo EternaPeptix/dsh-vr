@@ -2,8 +2,11 @@
  * Pure research-state rules shared by the harness tools and every view.
  *
  * Nothing here touches the filesystem or imports a plugin API: the same functions decide a gate
- * outcome inside the agent's tools and inside `bin/vr`, so the two cannot drift into disagreeing
+ * outcome inside the agent's tools and inside `tools/vr.mjs`, so the two cannot drift into disagreeing
  * copies of the same judgement.
+ *
+ * Nothing here reads Markdown either. State is the journal (lib/journal.js); the rules receive
+ * records, and the only Markdown functions left are the ones that write the generated views.
  */
 
 export const STATUSES = ['untested', 'active', 'blocked', 'reported', 'refuted', 'closed'];
@@ -74,74 +77,6 @@ export const THREAD_FRONTMATTER = [
 function unwrapFence(body) {
   const wrapped = /^(`{3,})[^\n`]*\n([\s\S]*)\n\1$/.exec(String(body));
   return wrapped === null ? String(body) : wrapped[2];
-}
-
-/**
- * Parse the frontmatter subset used by the state files: `key: value` lines only.
- *
- * Section headings are recognised line by line and only outside fenced code blocks, because captured
- * output legitimately contains `## ` lines. Splitting on every heading silently truncated whatever
- * followed it.
- */
-export function parseStateFile(text) {
-  // Windows-edited records arrive with CRLF; without this the frontmatter regex never matches
-  // and every field silently reads as undefined.
-  text = String(text ?? '').replace(/\r\n/g, '\n');
-  const frontmatter = {};
-  let body = text;
-  const match = /^---\n([\s\S]*?)\n---\n?/.exec(text);
-  if (match) {
-    body = text.slice(match[0].length);
-    for (const line of match[1].split('\n')) {
-      const colon = line.indexOf(':');
-      if (colon <= 0) continue;
-      const key = line.slice(0, colon).trim();
-      const value = line.slice(colon + 1).trim();
-      if (key) frontmatter[key] = value;
-    }
-  }
-
-  const sections = {};
-  const order = [];
-  const duplicates = [];
-  const lines = body.split('\n');
-  // Track the opening run length rather than toggling on any fence-looking line: a section that
-  // legitimately contains a four-backtick block wrapping a three-backtick one used to flip the
-  // state twice and hand whatever followed back to heading parsing.
-  let fenceRun = 0;
-  let current;
-  let buffer = [];
-  const flush = () => {
-    if (current !== undefined) {
-      sections[current] = unwrapFence(buffer.join('\n').trim());
-      if (order.filter((name) => name === current).length > 1) duplicates.push(current);
-    }
-    buffer = [];
-  };
-  let title;
-  for (const line of lines) {
-    const fenceMatch = /^\s*(`{3,})/.exec(line);
-    if (fenceMatch !== null) {
-      const run = fenceMatch[1].length;
-      if (fenceRun === 0) fenceRun = run;
-      else if (run >= fenceRun && /^\s*`{3,}\s*$/.test(line)) fenceRun = 0;
-      if (current !== undefined) buffer.push(line);
-      continue;
-    }
-    if (fenceRun === 0 && /^##[ \t]+\S/.test(line)) {
-      flush();
-      current = line.replace(/^##[ \t]+/, '').trim();
-      order.push(current);
-      continue;
-    }
-    if (fenceRun === 0 && title === undefined && /^#[ \t]+\S/.test(line)) {
-      title = line.replace(/^#[ \t]+/, '').trim();
-      continue;
-    }
-    if (current !== undefined) buffer.push(line);
-  }
-  flush();
-  return { frontmatter, sections, order, title, duplicates };
 }
 
 /**
@@ -399,18 +334,6 @@ export function deniedHostMatch(hosts, deniedDomains) {
   return undefined;
 }
 
-export function evidenceLinks(sections) {
-  const body = sections.Evidence ?? '';
-  const links = [];
-  // Match the whole list item: a `]` inside the title used to end the match early, which lost the
-  // link and made the evidence file look orphaned.
-  for (const line of body.split('\n')) {
-    const found = /^\s*[-*]\s*\[([A-Z]-\d+):\s*(.*)\]\(([^()]+)\)\s*$/.exec(line);
-    if (found !== null) links.push({ id: found[1], title: found[2], path: found[3] });
-  }
-  return links;
-}
-
 /** Harness tiers, cheapest first. A conclusion about a whole system needs more than a function harness. */
 export const TIER_ORDER = ['function', 'component', 'system'];
 
@@ -518,6 +441,15 @@ export function executionAttestation(evidenceStates, events, options = {}) {
   const caveats = [];
   for (const state of Array.isArray(evidenceStates) ? evidenceStates : []) {
     if (state?.exists !== true || state.kind !== 'execution') continue;
+    // Decided when the record was written and stored with it. The ledger rotates, so asking it again
+    // later would turn an attested record into an unattested one with age.
+    if (state.attested === true) continue;
+    if (state.attested === false) {
+      caveats.push(
+        `${state.id} claims kind execution, but no execution call had finished in its session when it was recorded: unattested (telemetry may have been off, or the record was written without running anything)`,
+      );
+      continue;
+    }
     const session = String(state.session ?? '').trim();
     if (session === '' || session === '-') {
       caveats.push(
@@ -552,7 +484,10 @@ export function executionAttestation(evidenceStates, events, options = {}) {
 export function evaluateGate(parsed, evidenceStates, options = {}) {
   const fm = parsed.frontmatter;
   const sections = parsed.sections;
-  const links = evidenceLinks(sections);
+  // A journal-backed thread carries its evidence list as data; only a parsed Markdown file needs the
+  // list recovered from its text.
+  // The evidence list is a field of the record. It is never recovered from the Evidence text.
+  const links = Array.isArray(parsed.links) ? parsed.links : [];
   const status = String(fm.status ?? '');
   const disposition = String(fm.disposition ?? '');
   const executed = evidenceStates.filter(
@@ -645,7 +580,7 @@ export function evaluateGate(parsed, evidenceStates, options = {}) {
       `${state.id} names ${bare.map((a) => a.path).join(', ')} without a recorded hash: drift cannot be detected, so this citation is not verified`,
     );
   }
-  const linkedIds = evidenceLinks(sections).map((link) => link.id);
+  const linkedIds = links.map((link) => link.id);
   const citesId = (text) => linkedIds.some((id) => new RegExp(`(?<![A-Za-z0-9])${id}(?![0-9])`).test(String(text ?? '')));
   if (!citesId(sections['Current assessment'])) {
     blocking.push('current assessment cites no evidence id');
@@ -783,23 +718,6 @@ export function scopeHostEntries(values) {
 }
 
 /**
- * The hosts a pending scope request asks for.
- *
- * Only the leading run of `requested host:` lines counts. The rest of the section is free text —
- * the justification and the programme text quoted as evidence — and reading host lines out of it
- * let a quoted sentence add a host the judge was never shown as requested.
- */
-export function pendingRequestedHosts(sectionText) {
-  const hosts = [];
-  for (const line of String(sectionText ?? '').replace(/\r\n/g, '\n').trim().split('\n')) {
-    const match = /^requested host:\s*(\S+)\s*$/i.exec(line);
-    if (match === null) break;
-    hosts.push(match[1]);
-  }
-  return hosts;
-}
-
-/**
  * Make free text safe to store as the body of a `## ` section that is not fenced.
  *
  * Thread and evidence sections are fenced on write. The engagement file is not: it is the one state
@@ -810,8 +728,9 @@ export function pendingRequestedHosts(sectionText) {
  * across rewrites. Whatever a reader may show as a line break is normalised to `\n` first, so the
  * parser and the person see the same lines.
  *
- * The three patterns mirror parseStateFile; test/regressions.test.mjs checks the result against the
- * parser itself, so a new structural line there fails here instead of drifting.
+ * Nothing reads the result back as state any more: it keeps the generated file showing one section
+ * per section. test/regressions.test.mjs still checks it against the importer's parser, which is the
+ * strictest reader of this format there is.
  */
 const STRUCTURAL_LINE = /^(?:#{1,2}[ \t]+\S|\s*`{3,})/;
 export function inertSectionBody(text) {

@@ -1,6 +1,48 @@
 # Changelog
 
 ## Unreleased
+- **Research state is a journal, not Markdown.** `research/journal.jsonl` holds one sealed line per
+  tool call; the state is what the lines add up to. `ENGAGEMENT.md`, the thread and evidence files,
+  `INDEX.md` and `DEFERRALS.md` are generated from it and never read back. The Markdown parser is
+  gone from the runtime and survives only in `tools/legacy-markdown.mjs`, for the one-off importer.
+  The reason: every state bug of the last review was text turning into structure — a line break
+  that became `confirmed: true`, a `##` inside captured output that became a section, a title with
+  a `]` that unlinked its evidence. Escaping closed them one at a time; storing fields closes the
+  class.
+- A directory holding Markdown state and no journal is refused until
+  `node tools/journal.mjs import <research dir>` has been run once. The import is not reversible in
+  place: keep a copy of the directory. Imported execution records are attested against whatever the
+  telemetry ledger still holds on that day. An evidence title that existed only in a thread's link
+  text is moved onto the record, and an artifact line that never had a hash is shown as
+  `(no hash recorded)` rather than as unreadable. The import has its own test suite.
+- Journal lines are sealed with an HMAC chained to the previous line, under a key outside the
+  research directory (`journalKeyFile`, default `~/.dsh-vr/journal.key`). An edited, added, removed
+  or reordered line, a journal cut short of the position last written, a replaced journal and a
+  deleted one are all refused, by every tool, with the line named. Editing `ENGAGEMENT.md` no longer
+  qualifies a scope: nothing reads it.
+- The host guard fails closed. A scope that cannot be read used to clear the finding, so a broken
+  state file let every host through; it now permits loopback only. An unjudged scope's hosts are a
+  proposal and are not reachable until a judge confirms them — they used to be permitted as soon as
+  `vr_scope_apply` recorded them.
+- The programme page stays reachable to the judge after `vr_scope_apply` replaces the page URL with
+  the programme's name: the URL is kept as `programme_url`.
+- Thread and evidence ids can no longer collide: writing tools run one at a time and an entry is
+  refused if another process wrote the journal first. An evidence record and its link are one entry.
+- Execution attestation is decided when the record is written and stored with it, so it no longer
+  changes when the telemetry ledger rotates. Only tools named in `executionTools` attest; the
+  harness's own tools finishing do not.
+- Terminal threads are immutable everywhere, `vr_evidence_classify` included. Reopening never
+  advances a thread: it returns to the stage it had reached, capped at `assessed`.
+- Completion claims live in the journal, one per goal; `COMPLETION-PENDING.json` is gone, so there
+  is no claim file for an agent to write. Applying a different scope over a qualified engagement
+  keeps the old one in the journal's history.
+- `vr_repair` compares threads with evidence records instead of directory listings, and
+  `apply: true` rewrites every Markdown view.
+- New operator commands: `tools/journal.mjs` (`import`, `verify`, `render`, `reseal`) and
+  `tools/vr.mjs`, a read-only terminal view that verifies the journal and never writes.
+- The load test now drives the tools and hooks end to end and reads state back from the journal
+  with the key: tampering, rollback, ids allocated at once, a thread walked to `REPORT`, the host
+  guard. Before this the suites never ran a hook.
 - Scope writes can no longer be steered by the text they record. A line break inside a
   `vr_scope_apply` field used to be written raw, so `authorization: "…\nconfirmed: true\n---"`
   qualified a scope with no judge. `renderEngagement` is now the one writer of `ENGAGEMENT.md` and

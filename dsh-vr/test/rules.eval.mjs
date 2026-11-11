@@ -7,7 +7,10 @@
  *
  * Run: node harness/dsh-vr/test/rules.eval.mjs
  */
-import { evaluateGate, missingStageRequirements, parseStateFile } from '../lib/rules.js';
+import { evaluateGate, missingStageRequirements } from '../lib/rules.js';
+// Fixtures are written as Markdown because that is the readable form; the importer's parser
+// turns them into the records the rules take.
+import { parseStateFile } from '../tools/legacy-markdown.mjs';
 
 const SECTIONS = {
   Question: 'Does the thing happen?',

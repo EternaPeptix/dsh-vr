@@ -10,6 +10,21 @@ file a public issue for anything that could let an engagement leak.
 This plugin runs inside an operator's DSH profile and writes research state to the workspace. It is
 not a sandbox and does not confine the agent it observes.
 
+Research state is an append-only journal, `research/journal.jsonl`, of typed records. Each line is
+sealed with an HMAC chained to the line before it, under a key kept outside the research directory
+(`~/.dsh-vr/journal.key` by default), and the position last written is kept beside that key. A
+journal that was edited, extended without the key, cut short, replaced or deleted fails
+verification; it is then refused whole, no scope counts as qualified, and the host guard permits
+nothing beyond loopback until an operator has run `tools/journal.mjs verify` and decided. The
+Markdown files beside the journal are generated for readers and are never read back.
+
+What that defends: the stored scope verdict, stage, evidence classification and completion claims
+against a file write or a shell command that edits them, and against observed content that would
+once have been parsed as structure. What it does not defend: the key is readable by the OS user the
+agent runs as. An agent that reads the key can seal lines of its own, and nothing here would notice.
+Treat the seal as tamper evidence against stray and injected writes, not as a control on an agent
+that is trying to defeat it; that takes a key its user cannot read.
+
 What the boundary layer does: refuses shell and fetch calls whose destination is not in the
 engagement's `allowed_hosts` when `enforceAllowedHosts` is on, and audits both allow and deny
 decisions to the telemetry ledger. Loopback is exempt unless `allowLoopback` is false. The
@@ -51,12 +66,18 @@ access control there.
   not a dishonest verifier. When the same agent claims and decides, the result says so.
 - Scan patterns are bounded in length and rejected for nested quantifiers, but they still run on the
   default engine.
-- State files are written atomically and fsynced; concurrent tool calls can still race on id
-  allocation.
-- `kind: execution` is the researcher's attestation, not something the harness observed. Records now
-  carry the session that wrote them, and `vr_gate` reports a caveat when that session shows no
-  finished tool call — but that is a consistency check against harness output, not proof that the
-  execution described actually happened, and it only reaches as far as the telemetry ledger does.
+- The journal key and the last-written position live in the operator's home directory, readable by
+  the agent's own user. Rollback detection is per machine: a journal moved to another machine is
+  checked line by line there, not against a position.
+- `tools/journal.mjs reseal` accepts whatever the journal holds. It is the operator's way out of a
+  refusal and is exactly as trustworthy as the look the operator took first; it keeps the previous
+  file beside the new one.
+- `kind: execution` is the researcher's attestation, not something the harness observed. Records
+  carry the session that wrote them, and whether that session had finished an execution-capable tool
+  call is decided when the record is written and stored with it; `vr_gate` reports an unattested
+  record as a caveat. That is a consistency check against harness output, not proof that the
+  execution described actually happened, and with telemetry off every execution record is
+  unattested.
 - The gate verifies records, not reality. Nothing stops an agent from writing a convincing evidence
   record that claims `kind: execution` with a fabricated observed response, and the attestation check
   only looks for any finished tool call in the same session, not for the specific command the record
