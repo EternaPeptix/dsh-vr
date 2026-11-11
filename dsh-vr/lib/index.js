@@ -46,6 +46,8 @@ import {
   deniedHostMatch,
   normaliseHost,
   hostGrounded,
+  readinessInvalidatedBy,
+  dashboardRequestAllowed,
 } from './rules.js';
 
 const name = 'dsh-vr';
@@ -88,6 +90,10 @@ const Config = z.object({
    * It is a convenience, not a boundary: turn it off when the engagement must not run local servers.
    */
   allowLoopback: z.boolean().default(true),
+  /** Extra Host header values the dashboard may be served under, e.g. a tunnel hostname. */
+  dashboardAllowHosts: z.string().default(''),
+  /** How long the dashboard state is reused before it is rebuilt from disk. */
+  dashboardCacheMs: z.natural().default(1500),
   /** How long an operator question waits before it settles as UNANSWERED. */
   questionTimeoutSeconds: z.number().default(300),
   /** Redirect the blocking built-in question tool to the timed one. */
@@ -1000,6 +1006,12 @@ function registerStateTools(ctx, config) {
 
       const fmThread = parsed.frontmatter;
       const bodySections = parsed.sections;
+      // Readiness is a judgement about the whole evidence set, so changing that set invalidates it.
+      const invalidated = readinessInvalidatedBy(fmThread);
+      for (const [key, value] of Object.entries(invalidated.changes)) {
+        if (value === undefined) delete fmThread[key];
+        else fmThread[key] = value;
+      }
       const existing = (bodySections.Evidence ?? '').trim();
       const isEmpty = existing === '' || existing === 'none' || existing === 'none recorded';
       const bullet = `- [${evidenceId}: ${fmEvidence.title}](evidence/${evidenceId}.md)`;
@@ -1010,7 +1022,10 @@ function registerStateTools(ctx, config) {
       return [
         `recorded ${evidenceId} on ${id}`,
         `path: ${file}`,
-        'Next: vr_stage to validated once this record is complete.',
+        ...invalidated.notes.map((line) => `note: ${line}`),
+        invalidated.notes.length > 0
+          ? 'Next: reassess and revalidate against the new evidence set, then vr_stage again.'
+          : 'Next: vr_stage to validated once this record is complete.',
       ].join('\n');
     },
   }));
@@ -2816,12 +2831,27 @@ async function buildDashboardState(ctx, config) {
 function registerDashboard(ctx, config) {
   const web = ctx.get('webServer') ?? ctx.webServer;
   if (web === undefined) return;
+  // Building the state reads every thread and hashes every cited artifact. A GUI that polls it was
+  // doing that work once per request; a short cache keeps the panel responsive without serving
+  // stale data for longer than a person would notice.
+  const cache = { at: 0, state: undefined };
   ctx.effect(() => web.register({
     kind: 'exact',
     path: '/vr/api/state',
-    async handler(_req, res) {
+    async handler(req, res) {
+      const policy = dashboardRequestAllowed(req?.headers, String(config.dashboardAllowHosts ?? '').split(',').filter(Boolean));
+      if (!policy.allowed) {
+        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: policy.reason }));
+        return;
+      }
       try {
-        const state = await buildDashboardState(ctx, config);
+        const nowMs = Date.now();
+        if (cache.state === undefined || nowMs - cache.at > config.dashboardCacheMs) {
+          cache.state = await buildDashboardState(ctx, config);
+          cache.at = nowMs;
+        }
+        const state = cache.state;
         res.writeHead(200, {
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',

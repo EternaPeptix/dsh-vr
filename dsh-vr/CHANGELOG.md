@@ -23,3 +23,7 @@
 - `concurrency` in ENGAGEMENT.md is the ceiling actually applied when opening threads.
 - Scope approval requires the judge's own host enumeration, and refuses hosts it does not cover.
 - `referenceHosts` exempts only the fetch tool, never shell; loopback exemption is configurable.
+- Recording evidence drops a thread at `assessed` or `ready` back to `validated` and clears its
+  revalidation, because both described the evidence set that just changed.
+- The dashboard refuses requests whose Host or Origin is not loopback (DNS rebinding), and reuses
+  its built state for `dashboardCacheMs` instead of rebuilding on every poll.

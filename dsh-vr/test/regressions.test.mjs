@@ -9,11 +9,13 @@
  *    citation looked exactly like a verified one.
  */
 import {
+  dashboardRequestAllowed,
   evaluateGate,
   fenced,
   hostGrounded,
   normaliseHost,
   parseStateFile,
+  readinessInvalidatedBy,
   renderThread,
 } from '../lib/rules.js';
 
@@ -183,6 +185,45 @@ check('a scheme and path are stripped before comparison', hostGrounded('https://
 check('an empty list grounds nothing', hostGrounded('example.com', []) === false);
 check('a port on the scope entry does not defeat the comparison', hostGrounded('example.com', ['example.com:8443']) === true);
 check('normaliseHost strips scheme, wildcard, path and port', normaliseHost('https://*.Example.com:8443/x') === 'example.com');
+
+// --- new evidence invalidates readiness ------------------------------------
+const readyInvalidation = readinessInvalidatedBy({
+  stage: 'ready',
+  reproduces: 'true',
+  revalidated_revision: 'abc123',
+  revalidated_at: '2026-01-01',
+});
+check('recording evidence drops a ready thread back to validated', readyInvalidation.changes.stage === 'validated');
+check('recording evidence clears the revalidation it invalidates',
+  readyInvalidation.changes.reproduces === undefined && readyInvalidation.changes.revalidated_revision === undefined);
+check('both invalidations are explained to the researcher', readyInvalidation.notes.length === 2);
+
+const validatedInvalidation = readinessInvalidatedBy({ stage: 'validated', reproduces: 'true' });
+check('a validated thread keeps its stage but loses its revalidation',
+  validatedInvalidation.changes.stage === undefined && validatedInvalidation.changes.reproduces === undefined);
+
+const candidateInvalidation = readinessInvalidatedBy({ stage: 'candidate' });
+check('a candidate thread is untouched by new evidence',
+  Object.keys(candidateInvalidation.changes).length === 0 && candidateInvalidation.notes.length === 0);
+
+const unsetInvalidation = readinessInvalidatedBy({});
+check('a record with no stage is not moved', unsetInvalidation.changes.stage === undefined);
+
+// --- dashboard request policy ---------------------------------------------
+// Loopback binding does not stop DNS rebinding: the request arrives carrying the attacker's hostname.
+check('a loopback Host is served', dashboardRequestAllowed({ host: '127.0.0.1:65451' }).allowed === true);
+check('localhost is served', dashboardRequestAllowed({ host: 'localhost:65451' }).allowed === true);
+check('an IPv6 loopback Host is served', dashboardRequestAllowed({ host: '[::1]:65451' }).allowed === true);
+check('a rebound hostname is refused', dashboardRequestAllowed({ host: 'findings.attacker.example' }).allowed === false);
+const foreignOrigin = dashboardRequestAllowed({ host: '127.0.0.1:65451', origin: 'https://attacker.example' });
+check('a cross-origin read is refused', foreignOrigin.allowed === false);
+check('the refusal says why', typeof foreignOrigin.reason === 'string' && foreignOrigin.reason.includes('Origin'));
+check('a same-origin read is served',
+  dashboardRequestAllowed({ host: '127.0.0.1:65451', origin: 'http://127.0.0.1:65451' }).allowed === true);
+check('a configured tunnel host is served when named',
+  dashboardRequestAllowed({ host: 'tunnel.example' }, ['tunnel.example']).allowed === true);
+check('a configured tunnel host is still refused without its Origin',
+  dashboardRequestAllowed({ host: 'tunnel.example', origin: 'https://other.example' }, ['tunnel.example']).allowed === false);
 
 console.log(failures === 0 ? 'all regression cases passed' : `${failures} regression case(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

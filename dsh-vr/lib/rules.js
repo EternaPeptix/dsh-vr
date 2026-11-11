@@ -253,6 +253,38 @@ export function networkHostsIn(commandText) {
   return [...hosts];
 }
 
+/**
+ * Whether a dashboard request may be served.
+ *
+ * The dashboard is served by the local Harness web server, which is bound to loopback. Loopback
+ * binding alone does not stop a hostile page from reaching it through DNS rebinding: the browser
+ * resolves an attacker-controlled name to 127.0.0.1 and the request arrives with that name in the
+ * Host header. Requiring Host to be loopback closes that, and an Origin that is not loopback is
+ * refused for the same reason.
+ */
+export function dashboardRequestAllowed(headers, extraHosts = []) {
+  const hostHeader = String(headers?.host ?? '').trim().toLowerCase();
+  const originHeader = String(headers?.origin ?? '').trim().toLowerCase();
+  const loopback = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+  const bareHost = hostHeader.replace(/:\d+$/, '');
+  const permitted = new Set([...loopback, ...extraHosts.map((host) => String(host).trim().toLowerCase())]);
+  if (hostHeader !== '' && !permitted.has(bareHost)) {
+    return { allowed: false, reason: `Host header "${hostHeader}" is not loopback; refusing to serve engagement data to it` };
+  }
+  if (originHeader !== '' && originHeader !== 'null') {
+    let originHost;
+    try {
+      originHost = new URL(originHeader).hostname.toLowerCase();
+    } catch {
+      return { allowed: false, reason: `Origin header "${originHeader}" is not a valid origin` };
+    }
+    if (!permitted.has(originHost)) {
+      return { allowed: false, reason: `Origin "${originHost}" is not loopback; refusing a cross-origin read of engagement data` };
+    }
+  }
+  return { allowed: true };
+}
+
 /** Scope entries are compared as bare hostnames; a wildcard records the domain it permits. */
 export function normaliseHost(value) {
   return String(value ?? '')
@@ -294,6 +326,37 @@ export function evidenceLinks(sections) {
 
 export function stageIndex(stage) {
   return STAGES.indexOf(String(stage ?? ''));
+}
+
+/**
+ * What recording a new evidence file invalidates.
+ *
+ * Readiness is a judgement about the whole evidence set, so changing that set invalidates it:
+ * a thread used to keep stage "ready" while evidence was added under it, which meant it could be
+ * reported on a basis nobody had assessed. The same applies to revalidation, which names the
+ * revision the previous evidence set was checked against.
+ *
+ * Returns the frontmatter changes to apply and one note per invalidation, so the caller can tell
+ * the researcher what has to be re-earned instead of silently resetting it.
+ */
+export function readinessInvalidatedBy(frontmatter) {
+  const fm = frontmatter ?? {};
+  const changes = {};
+  const notes = [];
+  const wasStage = String(fm.stage ?? '');
+  if (stageIndex(wasStage) > stageIndex('validated')) {
+    changes.stage = 'validated';
+    notes.push(
+      `stage reset from "${wasStage}" to "validated": the evidence set changed, so the assessment and revalidation no longer describe it`,
+    );
+  }
+  if (fm.revalidated_revision !== undefined || fm.revalidated_at !== undefined || fm.reproduces !== undefined) {
+    changes.revalidated_revision = undefined;
+    changes.revalidated_at = undefined;
+    changes.reproduces = undefined;
+    notes.push('revalidation cleared: it described the previous evidence set');
+  }
+  return { changes, notes };
 }
 
 /**
