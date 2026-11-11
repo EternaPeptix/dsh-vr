@@ -37,7 +37,8 @@
     "@deepseek-ai/schemastery": "*"
   },
   "scripts": {
-    "test": "node test/rules.eval.mjs && node test/roundtrip.test.mjs && node test/regressions.test.mjs && node test/import.test.mjs && node lib/netintent.test.mjs && node --import ./test/stub-register.mjs test/plugin-load.test.mjs"
+    "test": "node test/rules.eval.mjs && node test/roundtrip.test.mjs && node test/regressions.test.mjs && node test/import.test.mjs && node lib/netintent.test.mjs && node --import ./test/stub-register.mjs test/plugin-load.test.mjs",
+    "test:real": "node --import ./test/real-register.mjs test/plugin-load.test.mjs"
   },
   "engines": {
     "node": ">=20"

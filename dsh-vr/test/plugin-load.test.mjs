@@ -389,9 +389,9 @@ await main.run('vr_thread_update', { thread_id: opened[2], status: 'closed', dis
 const closedSeq = (await journalOf(root)).state.seq;
 const closedWrites = await Promise.all([
   main.refusal('vr_attempt', { thread_id: opened[2], note: 'one more try', progress: false }, exec),
-  main.refusal('vr_evidence_add', { thread_id: opened[2], title: 't', observed_response: 'o', target_state_check: 'c', kind: 'static', tier: 'function' }, exec),
+  main.refusal('vr_evidence_add', { thread_id: opened[2], title: 't', conditions: ['c'], observed_response: 'o', target_state_check: 'c', kind: 'static', tier: 'function' }, exec),
   main.refusal('vr_attribution', { thread_id: opened[2], mechanism: 'm', control_change: 'c', control_result: 'r' }, exec),
-  main.refusal('vr_revalidate', { thread_id: opened[2], revision: 'abc1234', reproduces: true, upstream_status: 'unfixed' }, exec),
+  main.refusal('vr_revalidate', { thread_id: opened[2], revision: 'abc1234', reproduces: true, upstream_status: 'unfixed', duplicate_check: 'none found' }, exec),
 ]);
 check('a closed thread takes no further records',
   closedWrites.every((message) => typeof message === 'string' && message.includes('terminal')) && (await journalOf(root)).state.seq === closedSeq,

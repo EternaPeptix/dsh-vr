@@ -242,6 +242,18 @@ Six suites:
   `REPORT`, a scope steered by the text it records, the host guard under each of those. State is
   read back from the journal file with the key, never from the generated Markdown.
 
+The load test runs against stubs of the two Harness packages, and the stubs accept almost anything.
+To run it against the packages the Host itself loads:
+
+```sh
+DSH_PACKAGE_ROOT=<directory whose node_modules holds @deepseek-ai/> npm run test:real
+```
+
+For the desktop app that directory is `Contents/Resources/app.asar/dsh` inside the app, and the test
+has to run under the app's own runtime (`Contents/Resources/runtime/bin/node`), which can read inside
+the archive. The real `defineTool` checks arguments against each tool's schema, so this is the run
+that catches a required argument the stubs let through.
+
 Run them after any change to `lib/`. They are fast and they catch the class of mistake that is
 otherwise invisible until a Host refuses to start.
 
