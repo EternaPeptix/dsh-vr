@@ -1,6 +1,25 @@
 # Changelog
 
 ## Unreleased
+- A completion verdict is refused when the pending claim names a different goal, when the objective
+  changed, when the claim is older than `completionClaimMinutes`, or when a named artifact changed
+  after the claim was made.
+- `vr_finish_goal` refuses a thread artifact whose gate is `HOLD`: a thread that does not support its
+  own claim cannot demonstrate that an objective was met.
+- `vr_scope_intake` refuses to overwrite an engagement that is already qualified; `force: true`
+  archives the previous file first.
+- The intake-pending check looks for the tool's own sentinel line instead of the word "provisional",
+  which legitimate programme text also contains.
+- Placeholders (`TBD`, `n/a`, `pending`, `wip`, `unknown`, `later`, `TODO`, `draft`, …) no longer
+  count as filled, and revalidation must name the revision it was checked against.
+- Section parsing tracks the opening fence length, so a four-backtick block containing three
+  backticks no longer ends its section early.
+- Duplicate section headings are reported as a gate caveat instead of resolving silently.
+- `vr_repair` reports evidence files that were never linked and links that point at nothing.
+- `vr_defer` validates the thread id it is given and keeps `DEFERRALS.md` within a bounded entry
+  count.
+- `minReportTier` and `requireExecutionAttestation` let an engagement demand a stronger harness tier
+  or treat unattested execution as blocking.
 - Expansion approval no longer qualifies an engagement that was not qualified.
 - Reopening a closed thread resets stage to assessed and clears revalidation.
 - CRLF normalised at parse entry.
