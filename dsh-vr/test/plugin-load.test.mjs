@@ -59,6 +59,8 @@ const config = {
   deferralsMaxEntries: 200,
   minReportTier: '',
   requireExecutionAttestation: false,
+  guardedTools: 'bash,pwsh,web_fetch',
+  executionTools: 'bash,pwsh,shell,exec',
 };
 
 const registered = [];
@@ -99,8 +101,10 @@ check('the module exports what the Loader expects',
   plugin?.name === 'dsh-vr' && Array.isArray(plugin?.inject) && typeof plugin?.apply === 'function',
   `name=${plugin?.name} inject=${Array.isArray(plugin?.inject)}`);
 check('the injected services the tools depend on are declared',
-  ['tools', 'workingDirectory', 'webServer'].every((service) => plugin.inject.includes(service)),
+  ['tools', 'workingDirectory'].every((service) => plugin.inject.includes(service)),
   JSON.stringify(plugin.inject));
+check('webServer is optional, so a headless host still loads the guard and the gate',
+  !plugin.inject.includes('webServer'), JSON.stringify(plugin.inject));
 
 let applyError;
 try {

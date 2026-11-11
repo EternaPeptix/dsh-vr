@@ -55,10 +55,13 @@ import {
 
 const name = 'dsh-vr';
 
-/** `tools` for registration; `workingDirectory` anchors state to the session's directory. */
-// webServer is a hard dependency so the dashboard route registers after the service mounts;
-// reading it lazily with ctx.get() silently skipped registration when it loaded later.
-const inject = ['tools', 'workingDirectory', 'webServer'];
+/**
+ * `workingDirectory` anchors state to the session's directory.
+ *
+ * `webServer` is deliberately not injected: it only carries the read-only dashboard route, and a host
+ * that never mounts it must still load the guard, the gate and every other tool.
+ */
+const inject = ['tools', 'workingDirectory'];
 
 const Config = z.object({
   enabled: z.boolean().default(true),
@@ -93,6 +96,10 @@ const Config = z.object({
    * It is a convenience, not a boundary: turn it off when the engagement must not run local servers.
    */
   allowLoopback: z.boolean().default(true),
+  /** Tools that can actually run the target; used to attest executed evidence. */
+  executionTools: z.string().default('bash,pwsh,shell,exec'),
+  /** Tools whose arguments the boundary hook inspects. Names must match the host tool names exactly. */
+  guardedTools: z.string().default('bash,pwsh,web_fetch'),
   /** Extra Host header values the dashboard may be served under, e.g. a tunnel hostname. */
   dashboardAllowHosts: z.string().default(''),
   /** How long the dashboard state is reused before it is rebuilt from disk. */
@@ -335,6 +342,12 @@ function scopeJudgeBrief(action, detail) {
 }
 
 /** Hosts the engagement declares as in scope, lower-cased. */
+/** Whether the engagement in this root has been judged and left confirmed true. */
+async function readEngagementConfirmed(root) {
+  const doc = await engagementDoc(root);
+  return doc !== undefined && String(doc.frontmatter.confirmed ?? '').toLowerCase() === 'true';
+}
+
 async function readAllowedHosts(root) {
   const text = await readIfExists(path.join(root, 'ENGAGEMENT.md'));
   if (text === undefined) return [];
@@ -427,6 +440,7 @@ async function evidenceStatesFor(root, id, parsed) {
       tier: String(evidence.frontmatter.tier ?? '').trim().toLowerCase() || undefined,
       // Which session wrote the record, so the gate can ask whether anything ran there.
       session: String(evidence.frontmatter.session ?? '').trim(),
+      created: String(evidence.frontmatter.created ?? '').trim(),
     });
   }
   return states;
@@ -860,7 +874,7 @@ function registerStateTools(ctx, config) {
         }
       }
       if (requested === 'ready') {
-        const gate = evaluateGate({ ...parsed, frontmatter: { ...fm, stage: 'ready' } }, evidenceStates, gateOptions(config));
+        const gate = await gateFor(root, { ...parsed, frontmatter: { ...fm, stage: 'ready' } }, evidenceStates, config);
         if (gate.decision !== 'REPORT') {
           for (const reason of gate.reasons) blocking.push(`ready: ${reason}`);
         }
@@ -1209,16 +1223,9 @@ function registerStateTools(ctx, config) {
       const id = String(args.thread_id);
       const { parsed } = await readThread(root, id);
       const evidenceStates = await evidenceStatesFor(root, id, parsed);
-      const gate = evaluateGate(parsed, evidenceStates, gateOptions(config));
-      // Attestation is a cross-check against harness output, not evidence; it is reported with the
-      // other caveats so an unattested execution is visible instead of silently accepted.
-      const ledger = await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'));
-      const unattested = executionAttestation(evidenceStates, ledger);
-      gate.caveats = [...(gate.caveats ?? []), ...unattested];
-      if (config.requireExecutionAttestation && unattested.length > 0) {
-        gate.reasons = [...gate.reasons, ...unattested.map((line) => `unattested execution: ${line}`)];
-        if (gate.decision === 'REPORT') gate.decision = 'HOLD';
-      }
+      // Attestation lives in gateFor so that vr_stage, the dashboard and completion fingerprints
+      // reach the same verdict this tool does.
+      const gate = await gateFor(root, parsed, evidenceStates, config);
       const fm = parsed.frontmatter;
       // Per-verdict telemetry: which rules actually fire is the only way to tell whether a rule
       // is load-bearing or noise. The gate itself stays deterministic.
@@ -1465,7 +1472,7 @@ function noteRegistration(ctx, config, outcome) {
       status: outcome,
       reason: '',
       args_bytes: 0,
-    }, config.telemetryMaxBytes);
+    }, config.telemetryMaxBytes).catch(() => {});
   } catch {
     /* never break activation over a log line */
   }
@@ -1482,7 +1489,7 @@ function noteQuestion(ctx, config, exec, status, detail) {
       status,
       reason: detail,
       args_bytes: 0,
-    }, config.telemetryMaxBytes);
+    }, config.telemetryMaxBytes).catch(() => {});
   } catch {
     /* auditing must never break the question */
   }
@@ -1810,7 +1817,7 @@ function registerFinishTool(ctx, config) {
 
       const base = sessionBase(ctx, exec);
 
-      const { fingerprints, problems } = await fingerprintArtifacts(root, base, artifacts);
+      const { fingerprints, problems } = await fingerprintArtifacts(root, base, artifacts, config);
       if (fingerprints.length === 0) {
         throw new Error(
           `refusing to finish: none of the named artifacts exist (${problems.join(', ')}). `
@@ -1929,7 +1936,7 @@ function registerFinishTool(ctx, config) {
         throw new Error('refusing this verdict: the claim records no artifact fingerprints, so nothing says the files still hold what the verifier read. Call vr_finish_goal again.');
       }
       const artifactNames = (Array.isArray(claim.artifacts) ? claim.artifacts : []).map((item) => String(item)).filter(Boolean);
-      const rechecked = await fingerprintArtifacts(root, sessionBase(ctx, exec), artifactNames);
+      const rechecked = await fingerprintArtifacts(root, sessionBase(ctx, exec), artifactNames, config);
       const drift = artifactFingerprintDrift(claim.fingerprints, rechecked.fingerprints);
       if (drift.length > 0) {
         await fs.rm(file, { force: true });
@@ -2660,8 +2667,14 @@ function registerBoundaryGuard(ctx, config) {
     .split(',')
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
-  if (hosts.length === 0) return;
-  const guarded = new Set(['bash', 'pwsh', 'web_fetch']);
+  if (hosts.length === 0 && config.enforceAllowedHosts !== true) return;
+  const guarded = new Set(
+    String(config.guardedTools ?? 'bash,pwsh,web_fetch')
+      .split(',')
+      .map((tool) => tool.trim())
+      .filter(Boolean),
+  );
+  if (guarded.size === 0) return;
   ctx.on('tools/pre-execute', async (exec, next) => {
     const name = String(exec?.name ?? '');
     if (!guarded.has(name)) return next();
@@ -2681,16 +2694,31 @@ function registerBoundaryGuard(ctx, config) {
           .split(',')
           .map((host) => host.trim().toLowerCase())
           .filter(Boolean);
-        if (allowed.length > 0) {
-          // referenceHosts is a documentation exemption, not a second scope: it applies only to the
-          // fetch tool, because a GET for documentation cannot act on the host the way a shell
-          // command can. Treating it as scope for bash let any configured host be contacted.
-          const referenceApplies = name === 'web_fetch';
-          outOfScope = contacted.find(
-            (host) => !hostPermitted(host, allowed, config.allowLoopback)
-              && !(referenceApplies && hostPermitted(host, reference, false)),
-          );
-        }
+        const scopeRoot = await researchRoot(ctx, config, exec);
+        const scopeDoc = await engagementDoc(scopeRoot);
+        const qualified = scopeDoc !== undefined
+          && String(scopeDoc.frontmatter.confirmed ?? '').toLowerCase() === 'true';
+        // The judge has to read the programme page before the scope can be judged, so that one host
+        // stays reachable through the fetch tool even while every other host is refused.
+        const programmeHost = (() => {
+          try {
+            return new URL(String(scopeDoc?.frontmatter?.programme ?? '')).hostname.toLowerCase();
+          } catch {
+            return undefined;
+          }
+        })();
+        // referenceHosts is a documentation exemption, not a second scope: it applies only to the
+        // fetch tool, because a GET for documentation cannot act on the host the way a shell
+        // command can. Treating it as scope for bash let any configured host be contacted.
+        const referenceApplies = name === 'web_fetch';
+        outOfScope = contacted.find((host) => {
+          if (hostPermitted(host, allowed, config.allowLoopback)) return false;
+          if (referenceApplies && hostPermitted(host, reference, false)) return false;
+          if (referenceApplies && programmeHost !== undefined && host === programmeHost) return false;
+          // Fail closed: an empty allowlist used to mean "everything is permitted", and an unjudged
+          // scope is not a scope.
+          return !qualified || allowed.length === 0 || true;
+        });
       } catch {
         outOfScope = undefined;
       }
@@ -2861,6 +2889,8 @@ async function buildDashboardState(ctx, config) {
     : path.resolve(process.cwd(), config.root);
   const engagement = await readEngagement(root);
   const ids = await listThreadIds(root);
+  // One ledger read for the whole build: attestation looks at tool_end rows, not at this request.
+  const ledger = await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'));
   const threads = [];
   let open = 0;
   for (const id of ids) {
@@ -2868,7 +2898,7 @@ async function buildDashboardState(ctx, config) {
     if (parsed === undefined) continue;
     const fm = parsed.frontmatter;
     const evidenceStates = await evidenceStatesFor(root, id, parsed);
-    const gate = evaluateGate(parsed, evidenceStates, gateOptions(config));
+    const gate = await gateFor(root, parsed, evidenceStates, config, ledger);
     const status = String(fm.status ?? 'unknown');
     const threadEngagement = String(fm.engagement ?? 'unscoped');
     if ((status === 'active' || status === 'untested') && threadEngagement === engagement) open += 1;
@@ -2932,9 +2962,13 @@ async function buildDashboardState(ctx, config) {
   };
 }
 
-function registerDashboard(ctx, config) {
+function registerDashboard(ctx, config, attemptsLeft = 20) {
   const web = ctx.get('webServer') ?? ctx.webServer;
-  if (web === undefined) return;
+  if (web === undefined) {
+    // The service can mount after this plugin; retry briefly rather than silently dropping the route.
+    if (attemptsLeft > 0) setTimeout(() => registerDashboard(ctx, config, attemptsLeft - 1), 250);
+    return;
+  }
   // Building the state reads every thread and hashes every cited artifact. A GUI that polls it was
   // doing that work once per request; a short cache keeps the panel responsive without serving
   // stale data for longer than a person would notice.
@@ -2988,7 +3022,7 @@ function sessionBase(ctx, exec) {
  * reduced to their gate decision for the same reason. A thread that is not report-ready cannot be
  * the demonstration that an objective was met.
  */
-async function fingerprintArtifacts(root, base, artifacts) {
+async function fingerprintArtifacts(root, base, artifacts, config) {
   const fingerprints = [];
   const problems = [];
   for (const artifact of artifacts) {
@@ -3001,7 +3035,7 @@ async function fingerprintArtifacts(root, base, artifacts) {
       }
       // eslint-disable-next-line no-await-in-loop
       const states = await evidenceStatesFor(root, artifact, parsed);
-      const gate = evaluateGate(parsed, states, gateOptions(config));
+      const gate = await gateFor(root, parsed, states, config);
       fingerprints.push({ name: artifact, kind: 'thread', gate: gate.decision });
       continue;
     }
@@ -3118,6 +3152,29 @@ function gateOptions(config) {
   return {
     minTier: String(config.minReportTier ?? '').trim().toLowerCase(),
   };
+}
+
+/**
+ * The one way this plugin decides readiness.
+ *
+ * Attestation used to be applied only by vr_gate, so vr_stage could advance a thread to ready while
+ * vr_gate held the same thread for unattested execution. Every caller goes through here now, so the
+ * verdict does not depend on which tool asked.
+ */
+async function gateFor(root, parsed, evidenceStates, config, ledger) {
+  const gate = evaluateGate(parsed, evidenceStates, gateOptions(config));
+  const events = ledger === undefined
+    ? await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'))
+    : ledger;
+  const unattested = executionAttestation(evidenceStates, events, {
+    executionTools: String(config.executionTools ?? '').split(',').map((tool) => tool.trim()).filter(Boolean),
+  });
+  gate.caveats = [...(gate.caveats ?? []), ...unattested];
+  if (config.requireExecutionAttestation && unattested.length > 0) {
+    gate.reasons = [...gate.reasons, ...unattested.map((line) => `unattested execution: ${line}`)];
+    if (gate.decision === 'REPORT') gate.decision = 'HOLD';
+  }
+  return gate;
 }
 
 function apply(ctx, config) {

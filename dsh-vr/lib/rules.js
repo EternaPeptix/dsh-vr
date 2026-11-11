@@ -414,6 +414,18 @@ export function evidenceLinks(sections) {
 /** Harness tiers, cheapest first. A conclusion about a whole system needs more than a function harness. */
 export const TIER_ORDER = ['function', 'component', 'system'];
 
+/**
+ * Whether a revision identifier was actually recorded.
+ *
+ * `isFilled` is the wrong question for this field: it rejects one-word answers, and real revisions
+ * look like `v2`, `1.0` or `r12`. What must not pass is a placeholder.
+ */
+export function revisionRecorded(value) {
+  const text = String(value ?? '').trim();
+  if (text === '') return false;
+  return !['none', 'n/a', 'na', 'unknown', 'tbd', 'pending', '-', '--'].includes(text.toLowerCase());
+}
+
 export function stageIndex(stage) {
   return STAGES.indexOf(String(stage ?? ''));
 }
@@ -486,14 +498,22 @@ export function missingStageRequirements(stage, parsed, evidenceStates) {
  * not necessarily the execution being described — so a mismatch is reported as a caveat rather than
  * used to block. Silence about it was the actual defect.
  */
-export function executionAttestation(evidenceStates, events) {
+export function executionAttestation(evidenceStates, events, options = {}) {
   const rows = Array.isArray(events) ? events : [];
+  // Counting every tool_end meant the vr_evidence_add call that wrote the record attested itself.
+  // Only execution-capable tools count, and only calls that finished before the record was written.
+  const executionTools = new Set(
+    (Array.isArray(options.executionTools) ? options.executionTools : ['bash', 'pwsh', 'shell', 'exec'])
+      .map((tool) => String(tool).trim().toLowerCase())
+      .filter(Boolean),
+  );
   const endedBySession = new Map();
   for (const row of rows) {
     if (row?.event !== 'tool_end') continue;
+    if (!executionTools.has(String(row.tool ?? '').toLowerCase())) continue;
     const session = String(row.session ?? '');
     if (session === '' || session === '-') continue;
-    endedBySession.set(session, (endedBySession.get(session) ?? 0) + 1);
+    endedBySession.set(session, [...(endedBySession.get(session) ?? []), String(row.ts ?? '')]);
   }
   const caveats = [];
   for (const state of Array.isArray(evidenceStates) ? evidenceStates : []) {
@@ -505,9 +525,15 @@ export function executionAttestation(evidenceStates, events) {
       );
       continue;
     }
-    if (!endedBySession.has(session)) {
+    const stamps = endedBySession.get(session) ?? [];
+    const created = Date.parse(String(state.created ?? ''));
+    const beforeRecord = stamps.filter((stamp) => {
+      const at = Date.parse(stamp);
+      return !Number.isFinite(at) || !Number.isFinite(created) || at <= created;
+    });
+    if (beforeRecord.length === 0) {
       caveats.push(
-        `${state.id} claims kind execution but the ledger holds no finished tool call for session ${session}: unattested (telemetry may be off, or the record was written elsewhere)`,
+        `${state.id} claims kind execution but the ledger holds no finished execution call for session ${session} before the record was written: unattested (telemetry may be off, or the record was written elsewhere)`,
       );
     }
   }
@@ -641,7 +667,7 @@ export function evaluateGate(parsed, evidenceStates, options = {}) {
   }
   if (!isFilled(sections.Revalidation)) {
     blocking.push('no revalidation record against the revision being reported');
-  } else if (!isFilled(fm.revalidated_revision)) {
+  } else if (!revisionRecorded(fm.revalidated_revision)) {
     // "I rechecked it" without saying against what is not a revalidation record.
     blocking.push('revalidation does not name the revision it was checked against');
   } else if (String(fm.reproduces ?? '').toLowerCase() !== 'true') {
