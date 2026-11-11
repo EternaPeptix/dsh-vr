@@ -1541,6 +1541,61 @@ function registerFanoutTool(ctx, config) {
   }));
 }
 
+/**
+ * Ground truth for context pressure.
+ *
+ * Models routinely report that they are "out of context" when they have used a fraction of the
+ * window, and the cost of that belief is real: work stops, goals get blocked, hand-offs happen early.
+ * This asks the token meter for the measured surface instead of letting the model guess.
+ */
+function registerContextTool(ctx, config) {
+  ctx.tools.register(toolText({
+    name: 'vr_context',
+    description: [
+      'Report this session actual context usage: measured tokens, the model context window, the',
+      'percentage used and what is left. Use this instead of estimating or guessing.',
+    ].join(' '),
+    parameters: {},
+    concurrencySafe: true,
+    async run(_args, exec) {
+      const meter = ctx.get('tokenMeter');
+      if (meter === undefined) throw new Error('the tokenMeter service is unavailable');
+      const session = exec?.agent?.session;
+      if (session === undefined) throw new Error('no session is bound to this tool call');
+
+      const measurement = meter.measure(session);
+      const requestContext = typeof session.requestContext === 'function' ? session.requestContext() : undefined;
+      const window = requestContext?.contextWindow;
+      const used = measurement.totalTokens;
+
+      const lines = [];
+      if (typeof window === 'number' && window > 0) {
+        const percent = (used / window) * 100;
+        const remaining = Math.max(0, window - used);
+        lines.push(
+          `context: ${used.toLocaleString()} of ${window.toLocaleString()} tokens used — ${percent.toFixed(1)}% — ${remaining.toLocaleString()} left`,
+        );
+        if (percent >= 90) {
+          lines.push('ACT NOW: finish what you have, record it, and stop opening new work.');
+        } else if (percent >= 75) {
+          lines.push('WRAP UP SOON: finish the current check and record the evidence.');
+        } else {
+          lines.push('ROOM TO WORK: this is not a reason to stop, defer, or block a goal.');
+        }
+      } else {
+        lines.push(
+          `context: ${used.toLocaleString()} tokens measured, but the routed model did not report a window size, so no percentage is available`,
+        );
+        lines.push('Do not treat the missing percentage as exhaustion.');
+      }
+
+      lines.push(`route: ${requestContext?.provider ?? 'unknown'}/${requestContext?.model ?? 'unknown'}`);
+      lines.push(`baseline: ${measurement.baseline.kind} · surface nodes: ${measurement.nodes.length}`);
+      return lines.join('\n');
+    },
+  }));
+}
+
 function registerScopeTools(ctx, config) {
   ctx.tools.register(toolText({
     name: 'vr_scope_status',
@@ -2422,6 +2477,7 @@ function apply(ctx, config) {
   registerGoalDiscipline(ctx, config);
   registerDeferTool(ctx, config);
   registerFanoutTool(ctx, config);
+  registerContextTool(ctx, config);
   if (config.telemetry) registerTelemetry(ctx, config);
   registerBoundaryGuard(ctx, config);
   registerStateEnrichment(ctx, config);
