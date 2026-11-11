@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- Each activation writes one `journal` line to the telemetry ledger saying what the plugin found
+  where its state lives: `ok` with the entry and thread counts, `empty`, or `refused` with the
+  reason. It is read-only, and it is how a Host still running an older copy is told apart from
+  one that loaded this one.
 - **Research state is a journal, not Markdown.** `research/journal.jsonl` holds one sealed line per
   tool call; the state is what the lines add up to. `ENGAGEMENT.md`, the thread and evidence files,
   `INDEX.md` and `DEFERRALS.md` are generated from it and never read back. The Markdown parser is

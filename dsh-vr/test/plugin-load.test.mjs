@@ -859,6 +859,46 @@ check('adding a host to the journal by hand closes the guard instead of opening 
   denied(afterTamper) && denied(inScopeAfterTamper) && /cannot be read/.test(String(inScopeAfterTamper?.reason))
     && (await curl('http://127.0.0.1:8787/')) === 'RAN', inScopeAfterTamper?.reason);
 
+// --- activation says what it found ---------------------------------------------------------------
+// The cut-over from an older copy of the plugin is confirmed from this line, so it has to be true.
+const activationEvents = async (dir) => {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const text = await fs.readFile(path.join(dir, 'telemetry', 'events.jsonl'), 'utf8').catch(() => '');
+    const found = text.split('\n').filter((line) => line.includes('"event":"journal"')).map((line) => JSON.parse(line));
+    if (found.length > 0) return found;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return [];
+};
+root = await main.freshRoot();
+await qualify(main);
+await openThread(main, 'is the activation line true?');
+const liveEntries = (await journalOf(root)).state.seq;
+await fs.rm(path.join(root, 'telemetry'), { recursive: true, force: true });
+load({ root });
+let noted = await activationEvents(root);
+check('activation records that the journal verified, and how much it holds',
+  noted.length === 1 && noted[0].status === 'ok' && noted[0].entries === liveEntries && noted[0].threads === 1,
+  JSON.stringify(noted));
+const beforeNote = await journalOf(root);
+await fs.writeFile(beforeNote.file, beforeNote.text.replace('is the activation line true?', 'is the activation line true!'));
+await fs.rm(path.join(root, 'telemetry'), { recursive: true, force: true });
+load({ root });
+noted = await activationEvents(root);
+check('activation over a journal that fails verification says refused, and counts nothing from it',
+  noted.length === 1 && noted[0].status === 'refused' && noted[0].threads === 0 && /failed verification/.test(noted[0].reason),
+  JSON.stringify(noted));
+const unusedRoot = path.join(scratch, 'never-used');
+await fs.mkdir(unusedRoot, { recursive: true });
+const keysBefore = (await fs.readdir(path.dirname(keyFile))).sort().join(',');
+load({ root: unusedRoot });
+noted = await activationEvents(unusedRoot);
+check('activation over an empty directory says empty and creates nothing but the ledger line',
+  noted.length === 1 && noted[0].status === 'empty'
+    && (await fs.readdir(unusedRoot)).join(',') === 'telemetry'
+    && (await fs.readdir(path.dirname(keyFile))).sort().join(',') === keysBefore,
+  `${JSON.stringify(noted)} ${(await fs.readdir(unusedRoot)).join(',')}`);
+
 await fs.rm(scratch, { recursive: true, force: true });
 
 console.log(failures === 0 ? 'all load cases passed' : `${failures} load case(s) failed`);

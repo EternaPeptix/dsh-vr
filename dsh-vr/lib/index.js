@@ -55,7 +55,7 @@ import {
 } from './rules.js';
 import { evidenceStates } from './evidence.js';
 import { diffRecord, evidenceKey, evidenceOfThread, nextNumbered } from './journal.js';
-import { JOURNAL_FILE, exclusive, openStore } from './store.js';
+import { JOURNAL_FILE, exclusive, openStore, readResearch } from './store.js';
 import { engagementDoc as engagementDocOf, engagementRecord, threadDoc } from './views.js';
 
 const name = 'dsh-vr';
@@ -1504,6 +1504,36 @@ function noteRegistration(ctx, config, outcome) {
   } catch {
     /* never break activation over a log line */
   }
+}
+
+/**
+ * One ledger line per activation saying what this plugin found where its state lives.
+ *
+ * A Host that is still running an older copy of this plugin writes no such line, and one that loaded
+ * this copy over a directory it cannot use says so here instead of at the first tool call.
+ * Read-only: no key is created and nothing under the research directory is touched.
+ */
+function noteJournal(config) {
+  void (async () => {
+    try {
+      const root = config.enrichRoot !== '' ? path.resolve(config.enrichRoot) : path.resolve(process.cwd(), config.root);
+      const found = await readResearch(root, { keyFile: storeOptions.keyFile });
+      const status = found.refusal !== undefined ? 'refused' : found.integrity.absent === true ? 'empty' : 'ok';
+      await appendTelemetry(path.join(root, 'telemetry', 'events.jsonl'), {
+        ts: nowIso(),
+        event: 'journal',
+        session: '-',
+        tool: 'activation',
+        status,
+        entries: found.integrity.events ?? 0,
+        threads: found.refusal === undefined ? found.state.threads.size : 0,
+        reason: found.refusal === undefined ? '' : clean(found.refusal, 300),
+        args_bytes: 0,
+      }, config.telemetryMaxBytes);
+    } catch {
+      /* never break activation over a log line */
+    }
+  })();
 }
 
 function noteQuestion(ctx, config, exec, status, detail) {
@@ -3283,6 +3313,7 @@ function apply(ctx, config) {
   registerBoundaryGuard(ctx, config);
   registerStateEnrichment(ctx, config);
   registerDashboard(ctx, config);
+  if (config.telemetry) noteJournal(config);
 }
 
 export { Config, apply, inject, name };
