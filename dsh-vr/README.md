@@ -89,6 +89,11 @@ Values that change what the gate believes, beyond the defaults:
 - `allowLoopback`, `referenceHosts`, `deniedHosts`, `enforceAllowedHosts` — see the boundary section.
 - `dashboardAllowHosts`, `dashboardCacheMs` — the dashboard is served only to loopback Host headers.
 
+The findings panel reads state when it mounts and when you press Refresh; it never polls. It reports a
+failed read instead of going blank, keeps the last successful data visible when it can, isolates a
+table that fails to render, and has a Hide findings toggle that blurs question text for screen
+sharing.
+
 `research/threads/INDEX.md` is derived state: it is regenerated after every write and is never read
 back as evidence, so a crash that leaves it stale costs nothing but a regeneration.
 

@@ -92,6 +92,9 @@ const ctx = {
   },
 };
 
+/** Every tool call in this file shares one synthetic agent so session-bound tools behave normally. */
+const repairExec = { agent: { session: { id: 'load-test' } } };
+
 check('the module exports what the Loader expects',
   plugin?.name === 'dsh-vr' && Array.isArray(plugin?.inject) && typeof plugin?.apply === 'function',
   `name=${plugin?.name} inject=${Array.isArray(plugin?.inject)}`);
@@ -136,6 +139,7 @@ try {
 check('a missing service is reported as the tool refusing, not as a crash',
   thrown instanceof Error && thrown.message.startsWith('vr_context:'), thrown?.message);
 
+
 // vr_repair must close the gap vr_evidence_add can leave: a file written but never linked.
 const threadDir = path.join(stateRoot, 'threads', 'thr-001');
 await fs.mkdir(path.join(threadDir, 'evidence'), { recursive: true });
@@ -176,7 +180,6 @@ await fs.writeFile(path.join(threadDir, 'evidence', 'E-001.md'), [
 ].join('\n'));
 
 const repairTool = registered.find((spec) => spec.name === 'vr_repair');
-const repairExec = { agent: { session: { id: 'load-test' } } };
 const dryRun = await repairTool.execute({}, repairExec);
 const untouched = await fs.readFile(path.join(threadDir, 'index.md'), 'utf8');
 check('vr_repair reports an unlinked evidence file without writing', dryRun.includes('would be linked') && !untouched.includes('E-001.md'), dryRun);
@@ -186,6 +189,28 @@ const linked = await fs.readFile(path.join(threadDir, 'index.md'), 'utf8');
 check('vr_repair links it when asked', linked.includes('E-001.md'), applied);
 check('the second pass has nothing left to do',
   (await repairTool.execute({}, repairExec)).includes('no inconsistencies'), 'still reports work');
+
+// vr_defer must refuse a thread id that does not exist, and must not grow without bound.
+const deferTool = registered.find((spec) => spec.name === 'vr_defer');
+let deferError;
+try {
+  await deferTool.execute({ reason: 'waiting on a decision', thread_id: 'thr-999' }, repairExec);
+} catch (error) {
+  deferError = error;
+}
+check('vr_defer refuses a thread id that names no thread',
+  deferError instanceof Error && deferError.message.includes('no such thread'), deferError?.message);
+config.deferralsMaxEntries = 3;
+for (let index = 0; index < 5; index += 1) {
+  // eslint-disable-next-line no-await-in-loop
+  await deferTool.execute({ reason: `blocker ${index}`, thread_id: 'thr-001' }, repairExec);
+}
+const deferrals = await fs.readFile(path.join(stateRoot, 'DEFERRALS.md'), 'utf8');
+check('DEFERRALS.md keeps only the configured number of entries',
+  (deferrals.match(/^## /gm) ?? []).length === 3, String((deferrals.match(/^## /gm) ?? []).length));
+check('dropping old entries is stated rather than silent', deferrals.includes('dropped at the 3-entry cap'));
+check('the newest entry survives the cap', deferrals.includes('blocker 4'));
+config.deferralsMaxEntries = 200;
 
 await fs.rm(stateRoot, { recursive: true, force: true });
 
