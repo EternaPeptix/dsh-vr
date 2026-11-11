@@ -89,6 +89,8 @@ const Config = z.object({
   goalDiscipline: z.boolean().default(true),
   /** 'never' refuses every model-initiated block (Codex has no such state); 'hard-only' allows externally-caused ones. */
   goalBlockPolicy: z.string().default('never'),
+  /** Advisory parallelism the fan-out helper reports; the real cap is the subagent plugin's. */
+  fanoutCeiling: z.number().default(24),
 });
 
 const IGNORED_DIRS = new Set([
@@ -1461,6 +1463,84 @@ function registerDeferTool(ctx, config) {
   }));
 }
 
+/**
+ * Fan-out helper.
+ *
+ * Raising the harness ceiling only matters if the orchestrator can prepare many workers without doing
+ * it one agonising turn at a time. This emits one complete brief per thread, in the shape AGENTS.md
+ * requires, so the Lead can issue every spawn in a single message and let them run concurrently.
+ */
+function registerFanoutTool(ctx, config) {
+  ctx.tools.register(toolText({
+    name: 'vr_fanout',
+    description: [
+      'Prepare worker briefs for many research threads at once.',
+      'Returns one ready-to-send brief per thread so they can all be spawned in a single message and',
+      'run concurrently instead of one per turn.',
+    ].join(' '),
+    parameters: {
+      threads: { type: 'array', items: { type: 'string' }, required: true, description: 'Thread ids, e.g. ["thr-042","thr-043"].' },
+      tier: { type: 'string', description: 'Harness tier every worker should try first: function, component or system.' },
+      max_concurrency: { type: 'integer', description: 'How many may run at once; defaults to the configured ceiling.' },
+    },
+    async run(args, exec) {
+      const root = await researchRoot(ctx, config, exec);
+      const engagement = await readEngagement(root);
+      const ids = (Array.isArray(args.threads) ? args.threads : []).map((id) => String(id).trim()).filter(Boolean);
+      if (ids.length === 0) throw new Error('threads must name at least one thread id');
+      const ceiling = Number.isInteger(args.max_concurrency) && args.max_concurrency > 0
+        ? args.max_concurrency
+        : config.fanoutCeiling;
+      const tier = ['function', 'component', 'system'].includes(String(args.tier))
+        ? String(args.tier)
+        : 'function';
+
+      const briefs = [];
+      const skipped = [];
+      for (const id of ids) {
+        const { parsed } = await readThread(root, id).catch(() => ({ parsed: undefined }));
+        if (parsed === undefined) {
+          skipped.push(`${id} (no such thread)`);
+          continue;
+        }
+        const fm = parsed.frontmatter;
+        const question = clip(parsed.sections.Question ?? '', 300);
+        const hypothesis = clip(parsed.sections.Hypothesis ?? '', 400);
+        const scope = clip(parsed.sections.Scope ?? '', 400);
+        const nextAction = clip(parsed.sections['Next action'] ?? '', 200);
+        briefs.push([
+          `Thread: ${id} (engagement ${engagement})`,
+          `Question: ${question || '(empty)'}`,
+          `Hypothesis: ${hypothesis || '(empty)'}`,
+          `Scope: ${scope || '(empty)'}`,
+          `Harness tier to try first: ${tier}`,
+          `Current stage: ${fm.stage ?? 'none'} · status ${fm.status ?? 'unknown'}`,
+          nextAction ? `The Lead's suggested next step: ${nextAction}` : undefined,
+          'Do not do: work that belongs to another thread, or widen scope beyond research/ENGAGEMENT.md.',
+          'Return: conditions, the exact request or run, the observed response, a separate state check,',
+          'and what it does not establish — recorded through vr_evidence_add as kind execution.',
+          'Stop when: you have one atomic check, or the attempt budget is exhausted; then report the blocker',
+          '(record it with vr_defer rather than blocking a goal).',
+        ].filter(Boolean).join('\n'));
+      }
+
+      if (briefs.length === 0) {
+        return `nothing to fan out.${skipped.length > 0 ? ` skipped: ${skipped.join(', ')}` : ''}`;
+      }
+
+      return [
+        `${briefs.length} brief(s) prepared; advisory concurrency ceiling ${ceiling}.`,
+        'Issue every spawn in ONE message so they run in parallel, then wait for all of them:',
+        '',
+        briefs.map((brief, index) => `--- worker ${index + 1} ---\n${brief}`).join('\n\n'),
+        skipped.length > 0 ? `skipped: ${skipped.join(', ')}` : '',
+        '',
+        'When results return, gate each with vr_gate before believing it.',
+      ].filter(Boolean).join('\n');
+    },
+  }));
+}
+
 function registerScopeTools(ctx, config) {
   ctx.tools.register(toolText({
     name: 'vr_scope_status',
@@ -2341,6 +2421,7 @@ function apply(ctx, config) {
   registerQuestionTool(ctx, config);
   registerGoalDiscipline(ctx, config);
   registerDeferTool(ctx, config);
+  registerFanoutTool(ctx, config);
   if (config.telemetry) registerTelemetry(ctx, config);
   registerBoundaryGuard(ctx, config);
   registerStateEnrichment(ctx, config);
