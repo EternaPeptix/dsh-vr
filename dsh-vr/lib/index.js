@@ -1148,7 +1148,7 @@ function registerStateTools(ctx, config) {
         `decision: ${gate.decision}`,
         `thread: ${id}  status: ${fm.status ?? 'unknown'}  stage: ${fm.stage ?? 'none'}  target: ${fm.target ?? 'unknown'}`,
         `evidence: ${gate.links.length} linked, ${gate.completeCount} complete, ${gate.executedCount ?? 0} executed`,
-        `attempts: ${fm.attempts ?? '0'}/${config.maxAttempts}${Number.parseInt(fm.attempts ?? '0', 10) >= config.maxAttempts ? ' — budget exhausted; this outcome was reached under a stop condition, not by converging' : ''}`,
+        `attempts: ${fm.attempts ?? '0'}/${config.maxAttempts}${Number.parseInt(fm.attempts ?? '0', 10) >= config.maxAttempts ? ' — attempt budget exhausted (wording applies to HOLD outcomes; a REPORT here converged)' : ''}`,
         ...gate.reasons.map((reason) => `  - ${reason}`),
         '',
         gate.decision === 'REPORT'
@@ -1382,7 +1382,7 @@ function noteQuestion(ctx, config, exec, status, detail) {
     void appendTelemetry(path.join(root, 'telemetry', 'events.jsonl'), {
       ts: nowIso(),
       event: 'question',
-      session: typeof exec?.agent?.id === 'string' ? exec.agent.id : '-',
+      session: typeof exec?.agent?.session?.id === 'string' ? exec.agent.session.id : '-',
       tool: 'ask_user_question',
       status,
       reason: detail,

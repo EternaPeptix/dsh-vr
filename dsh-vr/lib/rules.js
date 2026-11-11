@@ -90,12 +90,18 @@ export function parseStateFile(text) {
 
   const sections = {};
   const order = [];
+  const duplicates = [];
   const lines = body.split('\n');
   let fenced = false;
   let current;
   let buffer = [];
   const flush = () => {
-    if (current !== undefined) sections[current] = buffer.join('\n').trim();
+    if (current !== undefined) {
+      const raw = buffer.join('\n').trim();
+      const wrapped = /^(`{3,})[a-z0-9]*\n([\s\S]*)\n\1$/.exec(raw);
+      sections[current] = wrapped === null ? raw : wrapped[2];
+      if (order.filter((name) => name === current).length > 1) duplicates.push(current);
+    }
     buffer = [];
   };
   let title;
@@ -118,7 +124,7 @@ export function parseStateFile(text) {
     if (current !== undefined) buffer.push(line);
   }
   flush();
-  return { frontmatter, sections, order, title };
+  return { frontmatter, sections, order, title, duplicates };
 }
 
 /** `none` is a deliberate non-value everywhere except where a caller must supply a real one. */
@@ -179,9 +185,18 @@ export function networkHostsIn(commandText) {
   for (const segment of segments) {
     const tokens = segment.trim().split(/\s+/).filter(Boolean);
     if (tokens.length === 0) continue;
-    const first = tokens[0].replace(/^.*\//, '').toLowerCase();
-    if (!NETWORK_CLIENTS.has(first)) continue;
-    const tokens$ = tokens.slice(1);
+    // A client is rarely token 0: env assignments, sudo, time, nohup, xargs and wrappers all
+    // precede it, and checking only token 0 let every prefixed invocation through.
+    let clientIndex = -1;
+    for (let i = 0; i < tokens.length; i += 1) {
+      const candidate = tokens[i].replace(/^.*\//, '').toLowerCase();
+      if (NETWORK_CLIENTS.has(candidate)) {
+        clientIndex = i;
+        break;
+      }
+    }
+    if (clientIndex === -1) continue;
+    const tokens$ = tokens.slice(clientIndex + 1);
     for (let index = 0; index < tokens$.length; index += 1) {
       const token = tokens$[index];
       if (token.startsWith('-')) continue;
@@ -414,7 +429,8 @@ export function renderThread(fm, sections) {
   lines.push('---', '');
   lines.push(`# ${fm.title ?? fm.id}`, '');
   for (const section of THREAD_SECTIONS) {
-    lines.push(`## ${section}`, '', cleanText(sections[section], 20000) || 'none', '');
+    const body = cleanText(sections[section], 20000);
+    lines.push(`## ${section}`, '', body === '' || body === 'none' ? 'none' : fenced(body), '');
   }
   return `${lines.join('\n').trimEnd()}\n`;
 }
@@ -427,12 +443,8 @@ export function renderEvidence(fm, sections) {
   lines.push('---', '');
   lines.push(`# ${fm.title ?? fm.id}`, '');
   for (const section of EVIDENCE_SECTIONS) {
-    const value = cleanText(sections[section], 20000) || 'none';
-    if (section === 'Request' || section === 'Observed response') {
-      lines.push(`## ${section}`, '', value === 'none' ? 'none' : fenced(value), '');
-    } else {
-      lines.push(`## ${section}`, '', value, '');
-    }
+    const value = cleanText(sections[section], 20000);
+    lines.push(`## ${section}`, '', value === '' || value === 'none' ? 'none' : fenced(value), '');
   }
   return `${lines.join('\n').trimEnd()}\n`;
 }
