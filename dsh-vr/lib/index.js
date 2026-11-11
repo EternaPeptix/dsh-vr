@@ -136,8 +136,41 @@ async function readIfExists(file) {
 async function writeAtomic(file, text) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-  await fs.writeFile(temp, text, 'utf8');
+  const handle = await fs.open(temp, 'w');
+  try {
+    await handle.writeFile(text, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await fs.rename(temp, file);
+  try {
+    const dir = await fs.open(path.dirname(file), 'r');
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  } catch {
+    /* directory fsync is not supported everywhere; the rename is still atomic */
+  }
+}
+
+/**
+ * Scan patterns are agent-supplied, so they are bounded before they reach the regex engine: a
+ * nested quantifier like (a+)+ against one long line is a denial of service on the operator.
+ */
+const MAX_PATTERN_LENGTH = 400;
+function compileScanPattern(pattern) {
+  const text = String(pattern ?? '').trim();
+  if (text === '') throw new Error('pattern must not be empty');
+  if (text.length > MAX_PATTERN_LENGTH) {
+    throw new Error(`pattern is ${text.length} characters; the limit is ${MAX_PATTERN_LENGTH} because long patterns hide catastrophic backtracking`);
+  }
+  if (/\([^()]*[+*][^()]*\)[+*]|\[[^\]]*\][+*]{2}/.test(text)) {
+    throw new Error('pattern contains a nested quantifier such as (a+)+ which can backtrack catastrophically');
+  }
+  return new RegExp(text);
 }
 
 /** Engagement identity from research/ENGAGEMENT.md, or 'unscoped'. */
@@ -1158,7 +1191,7 @@ function registerScanEvalTool(ctx, config) {
       const fixtureRoot = path.isAbsolute(rootArg) ? rootArg : path.resolve(base, rootArg);
       let regex;
       try {
-        regex = new RegExp(String(args.pattern));
+        regex = compileScanPattern(args.pattern);
       } catch (error) {
         throw new Error(`invalid pattern: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1708,6 +1741,7 @@ function registerFinishTool(ctx, config) {
         pendingFile(root),
         JSON.stringify({
           goalId: String(view.id),
+          claimedBy: typeof exec?.agent?.id === 'string' ? exec.agent.id : 'unknown',
           objective: String(view.objective ?? ''),
           summary,
           artifacts,
@@ -1773,6 +1807,9 @@ function registerFinishTool(ctx, config) {
       const approved = args.approved === true;
       const rationale = clean(args.rationale, 600);
       if (rationale === '') throw new Error('rationale must say why the verification succeeded or failed');
+      const claimedBy = String(claim.claimedBy ?? 'unknown');
+      const decidedBy = typeof exec?.agent?.id === 'string' ? exec.agent.id : 'unknown';
+      const selfVerified = claimedBy !== 'unknown' && claimedBy === decidedBy;
 
       if (!approved) {
         await fs.rm(file, { force: true });
@@ -1792,6 +1829,7 @@ function registerFinishTool(ctx, config) {
         `goal completed after independent verification: ${claim.summary}`,
         `verified: ${(claim.verified ?? []).join(', ')}`,
         `verifier: ${clean(args.verifier ?? 'unnamed', 80)} — ${rationale}`,
+        selfVerified ? 'note: the same agent claimed and decided this completion; treat it as self-certified.' : '',
         `goal ${String(completed?.id ?? view.id)} is now ${String(completed?.phase ?? 'complete')}.`,
       ].join('\n');
     },
@@ -2098,7 +2136,7 @@ function registerScanTool(ctx, config) {
 
       let regex;
       try {
-        regex = new RegExp(String(args.pattern));
+        regex = compileScanPattern(args.pattern);
       } catch (error) {
         throw new Error(`invalid pattern: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -2442,7 +2480,7 @@ function registerBoundaryGuard(ctx, config) {
       return {
         kind: 'deny',
         reason: [
-          `Blocked by the engagement scope: "${outOfScope}" is not in allowed_hosts of`,
+          `Blocked by the host guard (best-effort matching, not a sandbox): "${outOfScope}" is not in allowed_hosts of`,
           'research/ENGAGEMENT.md. Add it there if it is genuinely in scope, otherwise test the',
           'local instance instead.',
         ].join(' '),

@@ -37,5 +37,15 @@
   },
   "scripts": {
     "test": "node test/rules.eval.mjs && node test/roundtrip.test.mjs && node lib/netintent.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EternaPeptix/dsh-vr.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EternaPeptix/dsh-vr/issues"
   }
 }
