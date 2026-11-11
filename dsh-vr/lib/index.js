@@ -87,6 +87,8 @@ const Config = z.object({
   redirectQuestionTool: z.boolean().default(true),
   /** Refuse goal blocks whose reason describes difficulty rather than an external obstacle. */
   goalDiscipline: z.boolean().default(true),
+  /** 'never' refuses every model-initiated block (Codex has no such state); 'hard-only' allows externally-caused ones. */
+  goalBlockPolicy: z.string().default('never'),
 });
 
 const IGNORED_DIRS = new Set([
@@ -1366,6 +1368,16 @@ function registerGoalDiscipline(ctx, config) {
     if (action !== 'blocked') return undefined;
 
     const reason = String(execution.arguments?.blocked_reason ?? '').trim();
+    if (config.goalBlockPolicy === 'never') {
+      return [
+        'refusing to block the goal.',
+        'A blocked goal disarms automatic continuation, so nothing continues and nobody is told why.',
+        'The model is not allowed this transition in the harness we are copying: it may only complete.',
+        'Do one of these instead — vr_defer to record the obstacle durably and keep working,',
+        'ask_operator if you need a decision from the operator (it times out and returns UNANSWERED),',
+        'or update_goal action=complete when the objective is actually achieved.',
+      ].join(' ');
+    }
     if (reason === '') {
       return 'action "blocked" needs a blocked_reason naming the external condition that stops you. If you cannot name one, keep working.';
     }
@@ -1391,6 +1403,62 @@ function registerGoalDiscipline(ctx, config) {
       'blocker in the thread and leave the goal active.',
     ].join(' ');
   }), 'dsh-vr goal discipline');
+}
+
+/**
+ * Deferral, in the shape Codex uses instead of blocking.
+ *
+ * Codex never lets the model stop a goal: the only terminal action available to it is `complete`,
+ * while pausing and budget exhaustion are system-controlled. What a working agent actually needs when
+ * it cannot proceed is somewhere to put the obstacle that does not end the run. That is this tool:
+ * the obstacle is recorded durably, the goal stays active, and the agent continues with whatever it
+ * can still do.
+ */
+function registerDeferTool(ctx, config) {
+  ctx.tools.register(toolText({
+    name: 'vr_defer',
+    description: [
+      'Record an obstacle without ending the work.',
+      'Use this instead of blocking a goal: the blocker becomes durable state that survives the',
+      'session, and the goal stays active so you can continue with anything else that is unblocked.',
+    ].join(' '),
+    parameters: {
+      reason: { type: 'string', required: true, description: 'What you cannot proceed with, in one sentence.' },
+      blocked_on: { type: 'string', description: 'The external thing you are waiting for, if any.' },
+      thread_id: { type: 'string', description: 'Thread this affects, e.g. thr-042.' },
+      next_action: { type: 'string', description: 'What you will do instead, or what unblocks this.' },
+    },
+    async run(args, exec) {
+      const root = await researchRoot(ctx, config, exec);
+      const file = path.join(root, 'DEFERRALS.md');
+      const reason = clean(args.reason, 600);
+      if (reason === '') throw new Error('reason must not be empty');
+      const line = [
+        `## ${nowIso()}`,
+        '',
+        `- reason: ${reason}`,
+        args.blocked_on ? `- blocked on: ${clean(args.blocked_on, 300)}` : undefined,
+        args.thread_id ? `- thread: ${clean(args.thread_id, 40)}` : undefined,
+        args.next_action ? `- next action: ${clean(args.next_action, 300)}` : undefined,
+        `- session: ${typeof exec?.agent?.id === 'string' ? exec.agent.id : '-'}`,
+        '',
+      ].filter((part) => part !== undefined).join('\n');
+
+      const existing = await readIfExists(file);
+      const header = existing === undefined
+        ? '# Deferrals\n\nObstacles recorded instead of ending a goal. Newest last.\n\n'
+        : '';
+      await writeAtomic(file, `${header}${existing ?? ''}${line}`);
+
+      return [
+        'recorded in research/DEFERRALS.md.',
+        '',
+        'Your goal stays active. Continue with the most useful unblocked step now.',
+        'If what you need is a decision from the operator, call ask_operator so the question is asked',
+        'with a timeout rather than parked silently.',
+      ].join('\n');
+    },
+  }));
 }
 
 function registerScopeTools(ctx, config) {
@@ -2272,6 +2340,7 @@ function apply(ctx, config) {
   registerScopeTools(ctx, config);
   registerQuestionTool(ctx, config);
   registerGoalDiscipline(ctx, config);
+  registerDeferTool(ctx, config);
   if (config.telemetry) registerTelemetry(ctx, config);
   registerBoundaryGuard(ctx, config);
   registerStateEnrichment(ctx, config);
