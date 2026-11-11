@@ -22,6 +22,18 @@ execution (`python3 -c`, a program that builds its own request, `git pull` again
 remote, redirects) is not covered. Treat the denylist as best effort and the allowlist as the mode
 you actually rely on.
 
+The guard is best effort even for the requests it does inspect, and it has residual blind spots that
+only a network-level egress control closes. It runs before dispatch and judges the host named in the
+call; HTTP redirects and DNS resolution happen after that check, so an allowed host that redirects to
+a denied one passes, and a denied host reached by IP address or through a CNAME that never spells its
+name is not recognised as denied. Closing those would take an egress control that resolves and
+rejects at connection time; the pre-execute hook described above is not one, and this plugin provides
+none.
+
+A refusal is written to the telemetry ledger but does not interrupt the operator: an unattended agent
+that tries to reach the wrong host is stopped quietly. The record exists for an incident review after
+the fact; it is not an alert, and nothing in this plugin raises one.
+
 Scope qualification is structurally defended rather than merely instructed: approval is refused unless
 the judge's own reply carries the line `Hosts read on the page: ...` and every host in `allowed_hosts`
 is covered by it. That does not make a judge honest, it makes a fabricated scope harder to pass off:
@@ -45,5 +57,9 @@ access control there.
   carry the session that wrote them, and `vr_gate` reports a caveat when that session shows no
   finished tool call — but that is a consistency check against harness output, not proof that the
   execution described actually happened, and it only reaches as far as the telemetry ledger does.
+- The gate verifies records, not reality. Nothing stops an agent from writing a convincing evidence
+  record that claims `kind: execution` with a fabricated observed response, and the attestation check
+  only looks for any finished tool call in the same session, not for the specific command the record
+  describes.
 - A gate pass is about support, not severity: it says the claim has evidence under the stated
   conditions and has been attributed and revalidated. It does not say the finding matters.
