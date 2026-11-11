@@ -400,7 +400,11 @@ function matchesExclude(file, patterns) {
   return patterns.some((pattern) => {
     const rule = String(pattern);
     if (rule.startsWith('*')) return base.endsWith(rule.slice(1));
-    return rule === base || rel.includes(rule);
+    const segment = rule.replace(/^\/+|\/+$/g, '');
+    if (segment === '') return false;
+    if (rule === base) return true;
+    if (rel.split('/').includes(segment)) return true;
+    if (rel.startsWith(`${segment}/`)) return true;
   });
 }
 
@@ -662,6 +666,11 @@ function registerStateTools(ctx, config) {
         }
         fm.disposition = '';
         const priorLog = isFilled(sections['Attempt log']) ? sections['Attempt log'] : '';
+        // Reopening invalidates the previous readiness claim: stage and revalidation must be re-earned.
+        fm.stage = 'assessed';
+        delete fm.reproduces;
+        delete fm.revalidated_at;
+        delete fm.revalidated_revision;
         sections['Attempt log'] = [priorLog, `- reopened from ${fm.status}: ${clean(args.reopen_reason, 300)}`]
           .filter(Boolean)
           .join('\n');
@@ -803,7 +812,7 @@ function registerStateTools(ctx, config) {
         .split('\n')
         .filter((line) => line.startsWith('- attempt'));
       const previous = priorAttempts[priorAttempts.length - 1] ?? '';
-      if (previous.includes(noteText)) {
+      if (previous.includes(noteText) && noteText.trim().length >= 12) {
         throw new Error(
           'stalled: this attempt repeats the previous attempt note exactly. Change the approach, narrow the hypothesis, or record what remains unknown as a blocker.',
         );
@@ -1971,7 +1980,8 @@ function registerScopeTools(ctx, config) {
           fm.allowed_hosts = [...new Set([...existing, ...added])].join(', ');
         }
         if (isExpansion) delete sections['Pending scope request'];
-        fm.confirmed = 'true';
+        // An approved expansion merges hosts; it does not qualify the engagement.
+        else fm.confirmed = 'true';
       } else if (isExpansion) {
         delete sections['Pending scope request'];
       } else {
@@ -2305,7 +2315,11 @@ async function appendTelemetry(file, record, maxBytes) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   try {
     const stat = await fs.stat(file);
-    if (stat.size > maxBytes) await fs.rename(file, `${file}.1`);
+    if (stat.size > maxBytes) {
+      await fs.rm(`${file}.2`, { force: true }).catch(() => {});
+      await fs.rename(`${file}.1`, `${file}.2`).catch(() => {});
+      await fs.rename(file, `${file}.1`);
+    }
   } catch {
     /* no file yet */
   }
@@ -2463,6 +2477,7 @@ function registerStateEnrichment(ctx, config) {
   stateRoots.push(path.resolve(process.cwd(), config.root));
 
   const note = async (event, extra) => {
+    if (!config.telemetry) return;
     try {
       const root = stateRoots[0];
       await appendTelemetry(path.join(root, 'telemetry', 'events.jsonl'), {

@@ -71,6 +71,9 @@ export const THREAD_FRONTMATTER = [
  * followed it.
  */
 export function parseStateFile(text) {
+  // Windows-edited records arrive with CRLF; without this the frontmatter regex never matches
+  // and every field silently reads as undefined.
+  text = String(text ?? '').replace(/\r\n/g, '\n');
   const frontmatter = {};
   let body = text;
   const match = /^---\n([\s\S]*?)\n---\n?/.exec(text);

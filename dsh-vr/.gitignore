@@ -1,0 +1,3 @@
+*.log
+cordis.patch.yml
+node_modules/

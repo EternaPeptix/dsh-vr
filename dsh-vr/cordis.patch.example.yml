@@ -1,0 +1,36 @@
+# Example bundle patch. Copy to cordis.patch.yml and set your own paths.
+#
+# cordis.patch.yml is gitignored on purpose: it names the engagement workspace, the hosts denied for
+# that engagement, and absolute paths that are specific to one machine.
+- insert:
+    - id: vr-harness
+      name: dsh-vr
+      config:
+        enabled: true
+        root: research
+        telemetry: true
+        enrich: true
+        # Absolute path to this workspace's research directory.
+        enrichRoot: "/absolute/path/to/your/research"
+        deniedHosts: "vendor-a.example,vendor-b.example"
+        enforceAllowedHosts: true
+        referenceHosts: ""
+        questionTimeoutSeconds: 300
+        redirectQuestionTool: true
+        goalDiscipline: true
+        goalBlockPolicy: never
+        fanoutCeiling: 24
+
+- id: subagent
+  config:
+    maxDepth: 3
+    maxActiveSubagents: 24
+
+- id: skill-filesystem
+  name: "@deepseek-ai/dsh-skill-filesystem"
+  disabled: false
+  config:
+    includeDefaultRoots: false
+    watch: true
+    customSkillDirs:
+      - "/absolute/path/to/your/research/skills"

@@ -90,5 +90,8 @@ const verdict = evaluateGate(shaOnly, executed);
 const shaMentioned = verdict.reasons.some((reason) => reason.includes('cites no evidence id'));
 check('SHA-256 is not read as evidence id A-256', shaMentioned, JSON.stringify(verdict.reasons));
 
+const crlf = parseStateFile('---\r\nid: E-001\r\nstatus: active\r\n---\r\n\r\n# title\r\n');
+check('CRLF frontmatter parses instead of reading empty', crlf.frontmatter.id === 'E-001', String(crlf.frontmatter.id));
+
 console.log(failures === 0 ? 'all round-trip cases passed' : `${failures} round-trip case(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

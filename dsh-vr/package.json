@@ -34,5 +34,8 @@
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/schemastery": "*"
+  },
+  "scripts": {
+    "test": "node test/rules.eval.mjs && node test/roundtrip.test.mjs && node lib/netintent.test.mjs"
   }
 }

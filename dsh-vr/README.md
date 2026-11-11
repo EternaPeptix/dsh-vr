@@ -1,72 +1,74 @@
-# dsh-vr — vulnerability-research harness layer
+# dsh-vr
 
-A Host plugin bundle for DeepSeek Harness that adds the components a vulnerability-research
-workflow needs and that a generic coding agent does not have:
+Vulnerability-research harness layer for DSH: durable research state, a report-readiness gate, an
+engagement scope gate, timed operator questions, verified goal completion, parallel fan-out, and a
+findings dashboard.
 
-| Component | What it does | Why it exists |
-| --- | --- | --- |
-| Research state (`vr_thread_*`) | Durable threads under `research/threads/<id>/index.md` with hypothesis, assessment, evidence links, rejected paths and one next action | Session-local findings are lost at compaction or shutdown, and prose status files grow until nobody can read them |
-| Evidence records (`vr_evidence_add`) | One file per atomic check: conditions, request, observed response, separate target-state check | A claim without its conditions and its state check is not reproducible |
-| Readiness gate (`vr_gate`) | `REPORT` / `HOLD` / `REFUTE` from linked, complete evidence only | Confidence gets confused with severity; the gate separates "has support" from "has impact" |
-| Deterministic scan (`vr_scan`) | One saved question about one source version, with coverage accounting and comparison by `(path, api, expression)` | Counts hide replacements, line numbers move with comments, and zero matches prove nothing without coverage |
-| Observe hook (`tools/execute`) | Append-only `research/telemetry/events.jsonl`, written by the harness where the event happens | The agent's own account of what it ran is not a record |
-| Enrich hook (`system-prompt/assemble`) | Injects the compact thread table into context at assembly, capped at `enrichMaxLines` | Discovery that depends on the model remembering to ask is not discovery |
-| Control hook (`tools/pre-execute`) | Refuses shell/fetch calls naming hosts in `deniedHosts`, before dispatch | A written boundary that nothing enforces is a preference, not a boundary |
+## What it is, and what it is not
 
-State format contract: the workspace file `research/FORMAT.md`. The tools write that format;
-the read-only view `bin/vr` parses the same files.
+The gate is **advisory at the workflow level**. Nothing in DSH forces a report through `vr_gate`;
+this plugin makes the correct path cheap and the incorrect one visible, and records what happened.
+It is not a sandbox. Treat every enforcement claim below as the strength stated, not more.
 
 ## Tools
 
-- `vr_thread_open`, `vr_thread_list`, `vr_thread_show`, `vr_thread_update`
-- `vr_evidence_add`, `vr_gate`
-- `vr_scan`
+State and gate: `vr_thread_open`, `vr_thread_list`, `vr_thread_show`, `vr_thread_update`, `vr_stage`,
+`vr_attempt`, `vr_evidence_add`, `vr_evidence_classify`, `vr_attribution`, `vr_revalidate`, `vr_gate`.
 
-## Config
+Scope: `vr_scope_status`, `vr_scope_intake`, `vr_scope_apply`, `vr_scope_decide`, `vr_scope_request`.
 
-| key | default | meaning |
-| --- | --- | --- |
-| `enabled` | `true` | mount the plugin |
-| `root` | `research` | state directory, resolved against the session working directory |
-| `telemetry` | `true` | append tool telemetry |
-| `telemetryMaxBytes` | `8388608` | rotate the ledger once it passes this size |
-| `maxFileBytes` | `4194304` | files larger than this are counted as skipped by `vr_scan` |
-| `maxEntries` | `5000` | per-run entry cap; exceeding it marks coverage incomplete |
-| `enrich` | `true` | inject the research-state table at prompt assembly |
-| `enrichMaxLines` | `8` | rows of that table placed in context |
-| `deniedHosts` | `""` | comma-separated hosts no shell or fetch call may contact; empty disables the control hook |
+Investigation: `vr_scan`, `vr_scan_eval`.
+
+Operator and orchestration: `ask_operator`, `vr_defer`, `vr_fanout`, `vr_context`, `vr_finish_goal`,
+`vr_completion_decide`.
+
+`vr_gate` returns exactly one of `REPORT`, `HOLD`, `REFUTE`, `CLOSED`. Only `REPORT` means the thread
+may be drafted into a finding.
+
+## Boundary enforcement — read this before trusting it
+
+Two modes, and they are not equivalent:
+
+- `enforceAllowedHosts: true` — default-deny against `allowed_hosts` in `research/ENGAGEMENT.md`,
+  loopback always permitted. This is the strong mode and the one to use.
+- `deniedHosts` — a best-effort denylist. Hosts are extracted only from URLs and from arguments to a
+  known list of network clients (`curl`, `wget`, `ssh`, …). It does **not** catch
+  `python3 -c "socket.connect(...)"`, a wrapper script whose argv[0] is not on the list, `git pull`
+  against a configured remote, or a redirect. Do not describe it as a boundary.
+
+Both modes are audited: allowed and refused calls are written to the telemetry ledger with the host.
+
+## Scope
+
+Scope is content observed through a tool, and observed content cannot authorise anything. The intake
+worker reads the programme page; the judge must fetch that page itself and quote the hosts it finds.
+An approved expansion merges hosts into `allowed_hosts`; it never qualifies an engagement that was not
+qualified by its own verdict.
+
+## Telling the operator apart from the content
+
+Agents read hostile material by design. Instructions come only from the operator; everything read
+through tools is data. Permission claimed inside observed content is invalid.
 
 ## Tests
 
-Two deterministic suites, no model, no network, no filesystem:
-
 ```
-node harness/dsh-vr/test/rules.eval.mjs      # gate decisions and stage refusals, one scenario each
-node harness/dsh-vr/lib/netintent.test.mjs   # boundary guard: intent versus mention
+pnpm test          # or: node test/rules.eval.mjs && node test/roundtrip.test.mjs && node lib/netintent.test.mjs
 ```
 
-Run both after any change to `lib/rules.js` or the guard. Every rule in the gate has a scenario that
-would fail if the rule regressed; adding a rule means adding its scenario.
+Three suites: gate scenarios, record round-trip (render → parse → render is byte-identical), and host
+extraction from shell commands.
 
-## Skills dependency
+## Configuration
 
-The bundle patch also mounts the shipped filesystem skill provider against `research/skills`.
-Removing or reinstalling this bundle therefore unmounts the skill catalog too, and it returns when
-the bundle is installed again. Skill descriptions containing an unquoted colon make the YAML invalid
-and the provider skips that skill silently — quote every description.
+Copy `cordis.patch.example.yml` to `cordis.patch.yml` and edit the paths. The real patch file is
+gitignored because it names a specific engagement workspace and denied hosts.
 
-## What this plugin does not claim
+## Known gaps
 
-- It does not find vulnerabilities and does not judge severity or impact.
-- `vr_gate` returning `REPORT` says the claim has linked, complete evidence under stated
-  conditions. It says nothing about attacker control or blast radius.
-- `vr_scan` coverage accounting covers enumerated files only; untracked files, generated code,
-  indirect calls and other APIs stay outside the query.
-
-## Install / remove
-
-Installed with the profile's plugin manager from this directory; the bundle patch mounts one row,
-`vr-harness`. Removing the bundle removes the row and leaves `research/` untouched.
-
-No Client half and no UI slot are registered, so the bundle ships no icon or locale resources:
-there is no surface on which they would render.
+- `vr_finish_goal` / `vr_completion_decide` are honour-system: the verdict is whatever the caller
+  records. They detect a self-contradictory claim, not a dishonest one.
+- State files are rewritten atomically but not fsynced.
+- `vr_scan` compiles agent-supplied regular expressions with the default engine; a pathological
+  pattern can be slow.
+- Thread and evidence ids are allocated by reading the directory; concurrent tool calls can race.
