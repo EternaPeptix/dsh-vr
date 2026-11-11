@@ -9,6 +9,8 @@
  *    citation looked exactly like a verified one.
  */
 import {
+  artifactFingerprintDrift,
+  completionClaimProblem,
   dashboardRequestAllowed,
   evaluateGate,
   executionAttestation,
@@ -245,6 +247,55 @@ check('static evidence is not questioned',
   executionAttestation([{ id: 'E-003', exists: true, kind: 'static', session: '' }], ledger).length === 0);
 check('a missing evidence file is not questioned',
   executionAttestation([{ id: 'E-004', exists: false, kind: 'execution', session: '' }], ledger).length === 0);
+
+// --- a fence inside a fence does not end the section early ------------------
+const nestedFence = parseStateFile([
+  '---', 'id: thr-911', '---',
+  '# title',
+  '## Attempt log', '',
+  '````text',
+  '```sh',
+  'echo hi',
+  '```',
+  'done',
+  '````', '',
+  '## Next action', '',
+  'file it',
+].join('\n'));
+check('a four-backtick block containing three backticks stays inside its section',
+  nestedFence.sections['Attempt log'].includes('echo hi'), nestedFence.sections['Attempt log']);
+check('the heading after the block is still parsed as a heading',
+  nestedFence.sections['Next action'] === 'file it', JSON.stringify(nestedFence.sections['Next action']));
+
+// --- a completion claim cannot complete a different goal -------------------
+const now = Date.parse('2026-01-01T00:00:00.000Z');
+const claim = { goalId: 'goal-1', objective: 'ship it', created: '2026-01-01T00:00:00.000Z' };
+const freshView = { id: 'goal-1', objective: 'ship it' };
+check('a matching claim is accepted',
+  completionClaimProblem(claim, freshView, { nowMs: now + 1000, maxAgeMs: 3600000 }) === undefined,
+  completionClaimProblem(claim, freshView, { nowMs: now + 1000, maxAgeMs: 3600000 }));
+check('a claim for another goal is refused',
+  String(completionClaimProblem(claim, { id: 'goal-2', objective: 'ship it' }, { nowMs: now, maxAgeMs: 3600000 })).includes('different goal'));
+check('a changed objective is refused',
+  String(completionClaimProblem(claim, { id: 'goal-1', objective: 'something else' }, { nowMs: now, maxAgeMs: 3600000 })).includes('objective changed'));
+check('an expired claim is refused',
+  String(completionClaimProblem(claim, freshView, { nowMs: now + 7200000, maxAgeMs: 3600000 })).includes('minutes old'));
+check('a claim with no timestamp is refused',
+  String(completionClaimProblem({ goalId: 'goal-1' }, freshView, { nowMs: now, maxAgeMs: 3600000 })).includes('no readable timestamp'));
+
+// --- artifacts are re-checked at verdict time ------------------------------
+const recorded = [
+  { name: 'report.md', kind: 'file', sha: 'aaa' },
+  { name: 'thr-001', kind: 'thread', gate: 'REPORT' },
+];
+check('unchanged artifacts produce no drift',
+  artifactFingerprintDrift(recorded, recorded).length === 0);
+check('a file that changed is reported',
+  artifactFingerprintDrift(recorded, [{ name: 'report.md', kind: 'file', sha: 'bbb' }, recorded[1]]).length === 1);
+check('a thread whose gate dropped is reported',
+  artifactFingerprintDrift(recorded, [recorded[0], { name: 'thr-001', kind: 'thread', gate: 'HOLD' }]).length === 1);
+check('a vanished artifact is reported',
+  artifactFingerprintDrift(recorded, [recorded[0]]).length === 1);
 
 console.log(failures === 0 ? 'all regression cases passed' : `${failures} regression case(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

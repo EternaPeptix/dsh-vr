@@ -55,6 +55,10 @@ const config = {
   goalDiscipline: true,
   goalBlockPolicy: 'never',
   fanoutCeiling: 24,
+  completionClaimMinutes: 60,
+  deferralsMaxEntries: 200,
+  minReportTier: '',
+  requireExecutionAttestation: false,
 };
 
 const registered = [];
@@ -103,7 +107,8 @@ try {
 }
 check('apply() runs without throwing', applyError === undefined, applyError?.message);
 
-check('tools were registered', registered.length >= 20, `registered ${registered.length}`);
+check('tools were registered', registered.length >= 21, `registered ${registered.length}`);
+check('the repair tool is available', registered.some((spec) => spec.name === 'vr_repair'));
 const names = registered.map((spec) => spec.name);
 const duplicates = names.filter((name, index) => names.indexOf(name) !== index);
 check('no tool is registered twice', duplicates.length === 0, [...new Set(duplicates)].join(', '));

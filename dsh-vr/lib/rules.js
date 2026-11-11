@@ -105,7 +105,10 @@ export function parseStateFile(text) {
   const order = [];
   const duplicates = [];
   const lines = body.split('\n');
-  let fenced = false;
+  // Track the opening run length rather than toggling on any fence-looking line: a section that
+  // legitimately contains a four-backtick block wrapping a three-backtick one used to flip the
+  // state twice and hand whatever followed back to heading parsing.
+  let fenceRun = 0;
   let current;
   let buffer = [];
   const flush = () => {
@@ -117,18 +120,21 @@ export function parseStateFile(text) {
   };
   let title;
   for (const line of lines) {
-    if (/^\s*```/.test(line)) {
-      fenced = !fenced;
+    const fenceMatch = /^\s*(`{3,})/.exec(line);
+    if (fenceMatch !== null) {
+      const run = fenceMatch[1].length;
+      if (fenceRun === 0) fenceRun = run;
+      else if (run >= fenceRun && /^\s*`{3,}\s*$/.test(line)) fenceRun = 0;
       if (current !== undefined) buffer.push(line);
       continue;
     }
-    if (!fenced && /^##[ \t]+\S/.test(line)) {
+    if (fenceRun === 0 && /^##[ \t]+\S/.test(line)) {
       flush();
       current = line.replace(/^##[ \t]+/, '').trim();
       order.push(current);
       continue;
     }
-    if (!fenced && title === undefined && /^#[ \t]+\S/.test(line)) {
+    if (fenceRun === 0 && title === undefined && /^#[ \t]+\S/.test(line)) {
       title = line.replace(/^#[ \t]+/, '').trim();
       continue;
     }
@@ -138,10 +144,32 @@ export function parseStateFile(text) {
   return { frontmatter, sections, order, title, duplicates };
 }
 
-/** `none` is a deliberate non-value everywhere except where a caller must supply a real one. */
+/**
+ * Placeholders that look like content.
+ *
+ * The gate asks whether a section is filled, and "TBD" answered it. Every gate-relevant section is
+ * free text about reasoning that cannot be inferred, so a placeholder there is the same failure as
+ * leaving it blank: the artifact the stage requires does not exist.
+ */
+const NON_VALUES = new Set([
+  'none', 'n/a', 'na', 'nil', 'null', 'tbd', 'tba', 'todo', 'fixme', 'pending', 'wip', 'unknown',
+  'unclear', 'later', 'draft', 'placeholder', 'xxx', '?', '-', '--', '...', 'not yet',
+  'to be determined', 'to be done', 'see above',
+]);
+
 export function isFilled(value) {
   const text = String(value ?? '').trim();
-  return text !== '' && text.toLowerCase() !== 'none';
+  if (text === '') return false;
+  const normalised = text
+    .toLowerCase()
+    .replace(/[`*_]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[.\s]+$/, '')
+    .trim();
+  if (NON_VALUES.has(normalised)) return false;
+  // A single short word cannot carry the reasoning these sections exist to record.
+  if (!normalised.includes(' ') && normalised.length < 4) return false;
+  return true;
 }
 
 /**
@@ -254,6 +282,65 @@ export function networkHostsIn(commandText) {
 }
 
 /**
+ * Why a pending completion claim cannot be used for the goal that is current now.
+ *
+ * The claim is a file; the goal it was made about is runtime state. Without this comparison a stale
+ * claim from an earlier goal could complete whatever goal happened to be current when the verdict
+ * arrived — including one that did not exist when the claim was written.
+ */
+export function completionClaimProblem(claim, view, { nowMs, maxAgeMs }) {
+  if (claim === null || typeof claim !== 'object' || Array.isArray(claim)) {
+    return 'the pending completion claim is unreadable';
+  }
+  const claimGoal = String(claim.goalId ?? '').trim();
+  if (claimGoal === '') return 'the pending completion claim does not name the goal it was made about';
+  const currentId = String(view?.id ?? '').trim();
+  if (currentId === '') return 'there is no current goal';
+  if (currentId !== claimGoal) {
+    return `the pending claim was made about goal ${claimGoal}, but the current goal is ${currentId}: refusing to complete a different goal`;
+  }
+  const claimObjective = String(claim.objective ?? '').trim();
+  const currentObjective = String(view?.objective ?? '').trim();
+  if (claimObjective !== '' && currentObjective !== '' && claimObjective !== currentObjective) {
+    return 'the goal objective changed after the claim was made';
+  }
+  const createdMs = Date.parse(String(claim.created ?? ''));
+  if (!Number.isFinite(createdMs)) return 'the pending claim has no readable timestamp';
+  if (Number.isFinite(maxAgeMs) && maxAgeMs > 0 && nowMs - createdMs > maxAgeMs) {
+    const ageMinutes = Math.round((nowMs - createdMs) / 60000);
+    return `the pending claim is ${ageMinutes} minutes old (limit ${Math.round(maxAgeMs / 60000)}): call vr_finish_goal again`;
+  }
+  return undefined;
+}
+
+/**
+ * What changed between the artifacts a completion claim named and those re-checked now.
+ *
+ * A claim is a statement about files at one moment. Between the claim and the verdict the file can
+ * change, and a verdict that does not look again completes a goal whose evidence no longer exists
+ * in the form the verifier read.
+ */
+export function artifactFingerprintDrift(recorded, current) {
+  const now = new Map((Array.isArray(current) ? current : []).map((item) => [String(item.name), item]));
+  const drifts = [];
+  for (const item of Array.isArray(recorded) ? recorded : []) {
+    const name = String(item?.name ?? '');
+    const seen = now.get(name);
+    if (seen === undefined) {
+      drifts.push(`${name} is no longer present`);
+      continue;
+    }
+    if (item.kind === 'file' && seen.kind === 'file' && seen.sha !== item.sha) {
+      drifts.push(`${name} changed after the claim was made`);
+    }
+    if (item.kind === 'thread' && seen.kind === 'thread' && seen.gate !== item.gate) {
+      drifts.push(`${name} was ${item.gate} when claimed and is ${seen.gate} now`);
+    }
+  }
+  return drifts;
+}
+
+/**
  * Whether a dashboard request may be served.
  *
  * The dashboard is served by the local Harness web server, which is bound to loopback. Loopback
@@ -323,6 +410,9 @@ export function evidenceLinks(sections) {
   }
   return links;
 }
+
+/** Harness tiers, cheapest first. A conclusion about a whole system needs more than a function harness. */
+export const TIER_ORDER = ['function', 'component', 'system'];
 
 export function stageIndex(stage) {
   return STAGES.indexOf(String(stage ?? ''));
@@ -433,7 +523,7 @@ export function executionAttestation(evidenceStates, events) {
  *
  * It deliberately does not judge severity, impact or novelty.
  */
-export function evaluateGate(parsed, evidenceStates) {
+export function evaluateGate(parsed, evidenceStates, options = {}) {
   const fm = parsed.frontmatter;
   const sections = parsed.sections;
   const links = evidenceLinks(sections);
@@ -493,6 +583,18 @@ export function evaluateGate(parsed, evidenceStates) {
   if (links.length > 0 && executed.length === 0) {
     blocking.push('no executed evidence: nothing in this thread was established by running the target');
   }
+  // A reproduction that isolates one function is not evidence about a whole instance. This stays off
+  // unless the engagement sets minReportTier, because only the researcher knows what the claim needs.
+  const minTier = String(options.minTier ?? '').trim().toLowerCase();
+  if (minTier !== '' && TIER_ORDER.includes(minTier) && executed.length > 0) {
+    const floor = TIER_ORDER.indexOf(minTier);
+    const strongEnough = executed.filter((state) => TIER_ORDER.indexOf(String(state.tier ?? '')) >= floor);
+    if (strongEnough.length === 0) {
+      blocking.push(
+        `no executed evidence at tier "${minTier}" or above: this engagement requires it for reporting, and every executed record is weaker`,
+      );
+    }
+  }
   if (unclassified.length > 0) {
     blocking.push(
       `evidence records do not say how they were established: ${unclassified.map((s) => s.id).join(', ')} (classify them, or record the check again with vr_evidence_add)`,
@@ -507,6 +609,9 @@ export function evaluateGate(parsed, evidenceStates) {
   // than skipped. It does not block on its own: records written before hashing existed are still
   // legitimate work, and refusing them outright would strand the engagement rather than fix it.
   const caveats = [];
+  for (const name of Array.isArray(parsed.duplicates) ? parsed.duplicates : []) {
+    caveats.push(`section "${name}" appears more than once: only the last occurrence is read, and the rest is ignored`);
+  }
   for (const state of evidenceStates) {
     const bare = Array.isArray(state.artifacts) ? state.artifacts.filter((a) => a.unhashed) : [];
     if (bare.length === 0) continue;
@@ -536,6 +641,9 @@ export function evaluateGate(parsed, evidenceStates) {
   }
   if (!isFilled(sections.Revalidation)) {
     blocking.push('no revalidation record against the revision being reported');
+  } else if (!isFilled(fm.revalidated_revision)) {
+    // "I rechecked it" without saying against what is not a revalidation record.
+    blocking.push('revalidation does not name the revision it was checked against');
   } else if (String(fm.reproduces ?? '').toLowerCase() !== 'true') {
     // A thread can reach stage ready and later be revalidated to "no longer reproduces".
     // Reporting it then would be reporting an observation already known not to hold.

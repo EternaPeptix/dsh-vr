@@ -45,6 +45,7 @@ const evidence = (kind) => ({
 
 const ACTIVE_READY = {
   id: 'thr-900', status: 'active', stage: 'ready', reproduces: 'true',
+  revalidated_revision: 'abc1234',
 };
 
 const SCENARIOS = [
@@ -132,6 +133,45 @@ const SCENARIOS = [
     reasonIncludes: 'no longer reproduces',
   },
   {
+    name: 'revalidation without a revision holds',
+    parsed: thread({ id: 'thr-907', status: 'active', stage: 'ready', reproduces: 'true' }),
+    evidence: [evidence('execution')],
+    expect: 'HOLD',
+    reasonIncludes: 'does not name the revision',
+  },
+  {
+    name: 'a function-tier execution carries no weight when the engagement requires component',
+    parsed: thread(ACTIVE_READY),
+    evidence: [{ ...evidence('execution'), tier: 'function' }],
+    options: { minTier: 'component' },
+    expect: 'HOLD',
+    reasonIncludes: 'no executed evidence at tier',
+  },
+  {
+    name: 'component-tier execution satisfies the component floor',
+    parsed: thread(ACTIVE_READY),
+    evidence: [{ ...evidence('execution'), tier: 'component' }],
+    options: { minTier: 'component' },
+    expect: 'REPORT',
+  },
+  {
+    name: 'a duplicated section is reported as a caveat rather than silently last-wins',
+    parsed: parseStateFile([
+      '---', 'id: thr-908', 'status: active', 'stage: ready', 'reproduces: true',
+      'revalidated_revision: abc1234', '---',
+      '## Evidence', '', '- [E-001: check](evidence/E-001.md)', '',
+      '## Current assessment', '', 'E-001 supports it.', '',
+      '## Impact assessment', '', 'crosses the boundary', '',
+      '## Attribution', '', 'mechanism m; control E-001', '',
+      '## Revalidation', '', 're-probed', '',
+      '## Next action', '', 'file it', '',
+      '## Impact assessment', '', 'second copy', '',
+    ].join('\n')),
+    evidence: [evidence('execution')],
+    expect: 'REPORT',
+    caveatIncludes: 'appears more than once',
+  },
+  {
     name: 'refuted with a deferral disposition is a result',
     parsed: thread({ id: 'thr-901', status: 'refuted', stage: 'ready', disposition: 'deferred-out-of-scope' }),
     evidence: [evidence('execution')],
@@ -171,6 +211,23 @@ const STAGE_SCENARIOS = [
   { name: 'validated accepts executed support', evidence: [evidence('execution')], refuse: false },
 ];
 
+// Stage requirements read free-text sections. A placeholder there used to count as content, so the
+// stage could be entered with "TBD" where the reasoning belongs.
+const PLACEHOLDER_SCENARIOS = ['TBD', 'n/a', 'pending', 'wip', 'unknown', 'later', 'TODO', 'draft'];
+const PLACEHOLDER_RESULTS = PLACEHOLDER_SCENARIOS.map((placeholder) => {
+  const parsed = thread({ id: 'thr-909', status: 'candidate', stage: 'validated' }, { 'Impact assessment': placeholder });
+  const reasons = missingStageRequirements('assessed', parsed, [evidence('execution')]);
+  return { placeholder, refused: reasons.length > 0, detail: reasons.join(' | ') };
+});
+const REAL_ASSESSMENT_RESULT = (() => {
+  const parsed = thread(
+    { id: 'thr-910', status: 'candidate', stage: 'validated' },
+    { 'Impact assessment': "crosses the tenant boundary: any local user can read another group's files" },
+  );
+  const reasons = missingStageRequirements('assessed', parsed, [evidence('execution')]);
+  return { refused: reasons.length > 0, detail: reasons.join(' | ') };
+})();
+
 let failures = 0;
 const check = (label, pass, detail) => {
   if (!pass) failures += 1;
@@ -178,16 +235,23 @@ const check = (label, pass, detail) => {
 };
 
 for (const scenario of SCENARIOS) {
-  const gate = evaluateGate(scenario.parsed, scenario.evidence);
+  const gate = evaluateGate(scenario.parsed, scenario.evidence, scenario.options);
   const reasons = gate.reasons.join(' | ');
+  const caveats = (gate.caveats ?? []).join(' | ');
   const decisionOk = gate.decision === scenario.expect;
   const reasonOk = scenario.reasonIncludes === undefined || reasons.includes(scenario.reasonIncludes);
+  const caveatOk = scenario.caveatIncludes === undefined || caveats.includes(scenario.caveatIncludes);
   check(
     `${scenario.name} [${scenario.expect}]`,
-    decisionOk && reasonOk,
-    `got ${gate.decision}: ${reasons}`,
+    decisionOk && reasonOk && caveatOk,
+    `got ${gate.decision}: ${reasons}${caveatOk ? '' : ` / caveats: ${caveats}`}`,
   );
 }
+
+for (const result of PLACEHOLDER_RESULTS) {
+  check(`"${result.placeholder}" does not satisfy the assessed stage`, result.refused, result.detail || 'accepted');
+}
+check('a real impact assessment satisfies the assessed stage', REAL_ASSESSMENT_RESULT.refused === false, REAL_ASSESSMENT_RESULT.detail);
 
 for (const scenario of STAGE_SCENARIOS) {
   const parsed = thread({ id: 'thr-906', status: 'candidate', stage: 'candidate' });

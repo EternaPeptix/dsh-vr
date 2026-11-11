@@ -51,7 +51,7 @@ window.__ModuleLoader__.load({
         });
     }
 
-    function ThreadTable({ rows }) {
+    function ThreadTable({ rows, hide }) {
       const columns = [
         ['thread', 78],
         ['status', 86],
@@ -102,118 +102,78 @@ window.__ModuleLoader__.load({
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
+                  filter: hide ? 'blur(4px)' : undefined,
                 },
-                title: thread.question,
+                // A hover tooltip would hand back the text the blur is meant to hide.
+                title: hide ? undefined : thread.question,
               }, thread.question)))),
       );
     }
 
-    function Dashboard() {
-      const [state, setState] = React.useState(null);
-      const [error, setError] = React.useState(null);
-      const [filter, setFilter] = React.useState('open');
-
-      const load = React.useCallback(() => {
-        fetch('/vr/api/state', { cache: 'no-store' })
-          .then((response) => {
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            return response.json();
-          })
-          .then((data) => {
-            setState(data);
-            setError(null);
-          })
-          .catch((failure) => setError(String(failure)));
-      }, []);
-
-      React.useEffect(() => {
-        load();
-      }, [load]);
-
-      const outer = {
-        height: '100%',
-        maxHeight: '100%',
-        // Flex parents clip a child that grows; minHeight lets this box scroll instead of overflowing.
-        minHeight: 0,
-        overflowY: 'auto',
-        overflowX: 'hidden',
-        overscrollBehavior: 'contain',
-        boxSizing: 'border-box',
-        padding: '16px 20px 40px',
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: 13,
-      };
-
-      if (error !== null) {
-        return h('div', { style: { ...outer, fontFamily: 'ui-monospace, monospace' } },
-          `dashboard could not read state: ${error}`);
-      }
-      if (state === null) {
-        return h('div', { style: { ...outer, opacity: 0.7 } }, 'reading research state…');
+    class PanelBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { failed: false };
       }
 
+      static getDerivedStateFromError() {
+        return { failed: true };
+      }
+
+      componentDidCatch(failure) {
+        // The fallback only says the panel broke; the console is where the cause survives.
+        console.error('[vr-dashboard] render failed', failure);
+      }
+
+      render() {
+        if (this.state.failed) return this.props.fallback;
+        return this.props.children;
+      }
+    }
+
+    function PanelFallback() {
+      return h('p', {
+        style: {
+          display: 'inline-block',
+          margin: '6px 0',
+          padding: '6px 10px',
+          borderRadius: 7,
+          border: '1px solid rgba(127,127,127,.35)',
+          background: 'rgba(255,208,214,.35)',
+          fontSize: 12,
+        },
+      }, 'panel failed to render');
+    }
+
+    function HeaderStats({ state }) {
+      if (state === null) return null;
+      const muted = { opacity: 0.62, fontSize: 12 };
+      return h(React.Fragment, null,
+        h('span', { key: 'engagement', style: muted }, `current ${state.engagement}`),
+        h('span', { key: 'open', style: muted }, `open ${state.open}/${state.ceiling}`),
+        h('span', { key: 'total', style: muted }, `${state.counts.total} threads`),
+        h('span', { key: 'report', style: muted }, `${state.counts.report} reportable`));
+    }
+
+    function PanelBody({ state, filter, hideFindings }) {
+      const muted = { opacity: 0.62, fontSize: 12 };
       const visible = state.threads.filter((thread) => {
         if (filter === 'open') return thread.status === 'active' || thread.status === 'untested';
         if (filter === 'report') return thread.gate === 'REPORT';
         return true;
       });
       const groups = groupByEngagement(visible, state.engagement);
-      const muted = { opacity: 0.62, fontSize: 12 };
-
-      return h('div', { style: outer },
-        h('div', {
-          style: {
-            position: 'sticky',
-            top: 0,
-            zIndex: 2,
-            margin: '-16px -20px 10px',
-            padding: '16px 20px 8px',
-            background: 'Canvas',
-            borderBottom: '1px solid rgba(127,127,127,.25)',
-          },
-        },
-          h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 14, flexWrap: 'wrap' } },
-            h('h2', { style: { margin: 0, fontSize: 17 } }, 'Research findings'),
-            h('span', { style: muted }, `current ${state.engagement}`),
-            h('span', { style: muted }, `open ${state.open}/${state.ceiling}`),
-            h('span', { style: muted }, `${state.counts.total} threads`),
-            h('span', { style: muted }, `${state.counts.report} reportable`)),
-          h('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' } },
-            ...['open', 'report', 'all'].map((option) =>
-              h('button', {
-                key: option,
-                onClick: () => setFilter(option),
-                style: {
-                  padding: '4px 10px',
-                  borderRadius: 7,
-                  border: '1px solid rgba(127,127,127,.35)',
-                  background: filter === option ? 'rgba(127,127,127,.18)' : 'transparent',
-                  cursor: 'pointer',
-                  fontSize: 12,
-                },
-              }, option)),
-            h('button', {
-              onClick: load,
-              style: {
-                marginLeft: 'auto',
-                padding: '4px 10px',
-                borderRadius: 7,
-                border: '1px solid rgba(127,127,127,.35)',
-                background: 'transparent',
-                cursor: 'pointer',
-                fontSize: 12,
-              },
-            }, 'refresh'))),
+      return h(React.Fragment, null,
         state.ruleFrequency.length > 0
-          ? h('p', { style: { ...muted, margin: '0 0 10px' } },
+          ? h('p', { key: 'blocking', style: { ...muted, margin: '0 0 10px' } },
               'blocking: ',
               state.ruleFrequency.map((row) => `${row.code} ×${row.n}`).join(' · '))
           : null,
         state.orphans !== undefined && state.orphans.length > 0
-          ? h('p', { style: { ...muted, margin: '0 0 12px', color: '#8a5a12' } },
+          ? h('p', { key: 'orphans', style: { ...muted, margin: '0 0 12px', color: '#8a5a12' } },
               `unlinked evidence files: ${state.orphans.join(', ')}`)
           : null,
-        groups.length === 0 ? h('p', { style: muted }, 'nothing matches this filter') : null,
+        groups.length === 0 ? h('p', { key: 'empty', style: muted }, 'nothing matches this filter') : null,
         ...groups.map((group) =>
           h('section', { key: group.engagement, style: { marginBottom: 22 } },
             h('div', {
@@ -235,13 +195,161 @@ window.__ModuleLoader__.load({
               h('span', { style: muted }, `${group.open} open`),
               h('span', { style: muted }, `${group.report} reportable`),
               group.hold > 0 ? h('span', { style: muted }, `${group.hold} held`) : null),
-            ThreadTable({ rows: group.rows.slice(0, 150) }),
+            // One row that cannot render should cost this table, not every group below it.
+            h(PanelBoundary, { fallback: h(PanelFallback) },
+              h(ThreadTable, { rows: group.rows.slice(0, 150), hide: hideFindings })),
             group.rows.length > 150
               ? h('p', { style: muted }, `${group.rows.length - 150} more in this engagement`)
               : null)),
-        h('p', { style: { ...muted, marginTop: 6 } },
-          `generated ${state.generatedAt} · read-only · decisions come from vr_gate, not from this page`),
-      );
+        h('p', { key: 'generated', style: { ...muted, marginTop: 6 } },
+          `generated ${state.generatedAt} · read-only · decisions come from vr_gate, not from this page`));
+    }
+
+    function Dashboard() {
+      const [state, setState] = React.useState(null);
+      const [error, setError] = React.useState(null);
+      const [filter, setFilter] = React.useState('open');
+      const [hideFindings, setHideFindings] = React.useState(false);
+      const [readAt, setReadAt] = React.useState(null);
+      const [loading, setLoading] = React.useState(false);
+      // Bumped after every successful read so boundaries that latched on bad data get remounted;
+      // otherwise a refresh could never show the data that replaced the failure.
+      const [generation, setGeneration] = React.useState(0);
+      const mounted = React.useRef(true);
+      const inFlight = React.useRef(null);
+
+      const load = React.useCallback(() => {
+        // A second refresh must not race the first; aborting the older request makes the newest
+        // response the only one that can land.
+        if (inFlight.current !== null) inFlight.current.abort();
+        const controller = new AbortController();
+        inFlight.current = controller;
+        setLoading(true);
+        fetch('/vr/api/state', { cache: 'no-store', signal: controller.signal })
+          .then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.json();
+          })
+          .then((data) => {
+            if (!mounted.current || controller.signal.aborted) return;
+            setState(data);
+            setError(null);
+            setReadAt(new Date());
+            setLoading(false);
+            setGeneration((value) => value + 1);
+          })
+          .catch((failure) => {
+            // Aborts are this component's own doing, not a read failure worth showing.
+            if (!mounted.current || controller.signal.aborted) return;
+            setError(String(failure));
+            setLoading(false);
+          });
+      }, []);
+
+      React.useEffect(() => {
+        mounted.current = true;
+        load();
+        return () => {
+          mounted.current = false;
+          if (inFlight.current !== null) inFlight.current.abort();
+        };
+      }, [load]);
+
+      const outer = {
+        height: '100%',
+        maxHeight: '100%',
+        // Flex parents clip a child that grows; minHeight lets this box scroll instead of overflowing.
+        minHeight: 0,
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        overscrollBehavior: 'contain',
+        boxSizing: 'border-box',
+        padding: '16px 20px 40px',
+        fontFamily: 'system-ui, sans-serif',
+        fontSize: 13,
+      };
+      const muted = { opacity: 0.62, fontSize: 12 };
+      const buttonStyle = {
+        padding: '4px 10px',
+        borderRadius: 7,
+        border: '1px solid rgba(127,127,127,.35)',
+        background: 'transparent',
+        cursor: 'pointer',
+        fontSize: 12,
+      };
+
+      return h('div', { style: outer },
+        h('div', {
+          key: 'header',
+          style: {
+            position: 'sticky',
+            top: 0,
+            zIndex: 2,
+            margin: '-16px -20px 10px',
+            padding: '16px 20px 8px',
+            background: 'Canvas',
+            borderBottom: '1px solid rgba(127,127,127,.25)',
+          },
+        },
+          h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 14, flexWrap: 'wrap' } },
+            h('h2', { style: { margin: 0, fontSize: 17 } }, 'Research findings'),
+            h(PanelBoundary, { key: `stats-${generation}`, fallback: h(PanelFallback) },
+              h(HeaderStats, { state }))),
+          h('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' } },
+            ...['open', 'report', 'all'].map((option) =>
+              h('button', {
+                key: option,
+                onClick: () => setFilter(option),
+                style: {
+                  ...buttonStyle,
+                  background: filter === option ? 'rgba(127,127,127,.18)' : 'transparent',
+                },
+              }, option)),
+            h('button', {
+              key: 'refresh',
+              onClick: load,
+              disabled: loading,
+              style: {
+                ...buttonStyle,
+                marginLeft: 'auto',
+                cursor: loading ? 'default' : 'pointer',
+                opacity: loading ? 0.6 : 1,
+              },
+            }, 'Refresh'),
+            h('button', {
+              key: 'hide-findings',
+              onClick: () => setHideFindings((value) => !value),
+              'aria-pressed': hideFindings,
+              style: {
+                ...buttonStyle,
+                background: hideFindings ? 'rgba(127,127,127,.18)' : 'transparent',
+              },
+            }, 'Hide findings'),
+            // The time is the moment the fetch completed, which is what an operator actually needs
+            // when deciding whether the page reflects the state they just changed.
+            h('span', { key: 'read-at', style: muted },
+              readAt === null ? 'not read yet' : `updated ${readAt.toLocaleTimeString()}`))),
+        error === null
+          ? null
+          : h('p', {
+              key: 'failure',
+              style: {
+                margin: '0 0 12px',
+                padding: '6px 10px',
+                borderRadius: 7,
+                border: '1px solid rgba(138,42,42,.45)',
+                background: 'rgba(255,208,214,.35)',
+                fontSize: 12,
+              },
+            },
+              state === null
+                ? `dashboard could not read state: ${error}`
+                : `dashboard could not read state: ${error} — showing the last successful read`),
+        h(PanelBoundary, { key: `body-${generation}`, fallback: h(PanelFallback) },
+          state === null
+            ? h('p', { key: 'waiting', style: muted },
+                error === null ? 'reading research state…' : 'no state loaded yet')
+            : h(PanelBody, { state, filter, hideFindings })));
     }
 
     const Icon = () =>

@@ -49,6 +49,8 @@ import {
   readinessInvalidatedBy,
   dashboardRequestAllowed,
   executionAttestation,
+  completionClaimProblem,
+  artifactFingerprintDrift,
 } from './rules.js';
 
 const name = 'dsh-vr';
@@ -105,6 +107,14 @@ const Config = z.object({
   goalBlockPolicy: z.string().default('never'),
   /** Advisory parallelism the fan-out helper reports; the real cap is the subagent plugin's. */
   fanoutCeiling: z.number().default(24),
+  /** A completion claim older than this is refused, so a forgotten claim cannot complete a later goal. */
+  completionClaimMinutes: z.natural().default(60),
+  /** Minimum harness tier required for executed evidence to support a report. Empty means no rule. */
+  minReportTier: z.string().default(''),
+  /** Treat executed evidence the telemetry ledger cannot attest as blocking instead of a caveat. */
+  requireExecutionAttestation: z.boolean().default(false),
+  /** Deferral entries kept in DEFERRALS.md; the oldest are dropped so the file stays readable. */
+  deferralsMaxEntries: z.natural().default(200),
 });
 
 const IGNORED_DIRS = new Set([
@@ -234,9 +244,12 @@ async function scopeProblems(root) {
   }
   const hosts = String(fm.allowed_hosts ?? '').split(',').map((h) => h.trim()).filter(Boolean);
   if (hosts.length === 0) problems.push('allowed_hosts is empty');
-  // The provisional marker lives in the body; surface it here so the status list names the real gap.
+  // Look for this tool's own sentinel line, not for the word: a programme whose own text says its
+  // assets are provisional would otherwise make its engagement permanently unqualifiable.
   const inScope = String(doc.sections?.['In scope'] ?? '');
-  if (/provisional/i.test(inScope)) problems.push('the programme page has not been read yet');
+  const intakePending = inScope.includes('<!-- vr-intake-pending -->')
+    || /^Provisional: the programme page has not been read yet\.?$/m.test(inScope);
+  if (intakePending) problems.push('the programme page has not been read yet');
   return problems;
 }
 
@@ -847,7 +860,7 @@ function registerStateTools(ctx, config) {
         }
       }
       if (requested === 'ready') {
-        const gate = evaluateGate({ ...parsed, frontmatter: { ...fm, stage: 'ready' } }, evidenceStates);
+        const gate = evaluateGate({ ...parsed, frontmatter: { ...fm, stage: 'ready' } }, evidenceStates, gateOptions(config));
         if (gate.decision !== 'REPORT') {
           for (const reason of gate.reasons) blocking.push(`ready: ${reason}`);
         }
@@ -1196,11 +1209,16 @@ function registerStateTools(ctx, config) {
       const id = String(args.thread_id);
       const { parsed } = await readThread(root, id);
       const evidenceStates = await evidenceStatesFor(root, id, parsed);
-      const gate = evaluateGate(parsed, evidenceStates);
+      const gate = evaluateGate(parsed, evidenceStates, gateOptions(config));
       // Attestation is a cross-check against harness output, not evidence; it is reported with the
       // other caveats so an unattested execution is visible instead of silently accepted.
       const ledger = await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'));
-      gate.caveats = [...(gate.caveats ?? []), ...executionAttestation(evidenceStates, ledger)];
+      const unattested = executionAttestation(evidenceStates, ledger);
+      gate.caveats = [...(gate.caveats ?? []), ...unattested];
+      if (config.requireExecutionAttestation && unattested.length > 0) {
+        gate.reasons = [...gate.reasons, ...unattested.map((line) => `unattested execution: ${line}`)];
+        if (gate.decision === 'REPORT') gate.decision = 'HOLD';
+      }
       const fm = parsed.frontmatter;
       // Per-verdict telemetry: which rules actually fire is the only way to tell whether a rule
       // is load-bearing or noise. The gate itself stays deterministic.
@@ -1567,22 +1585,39 @@ function registerDeferTool(ctx, config) {
       const file = path.join(root, 'DEFERRALS.md');
       const reason = clean(args.reason, 600);
       if (reason === '') throw new Error('reason must not be empty');
+      // A typo in the thread id used to orphan the blocker silently, which is the opposite of what
+      // recording it is for.
+      const threadId = args.thread_id === undefined ? '' : clean(args.thread_id, 40);
+      if (threadId !== '') {
+        if (!/^thr-\d+$/.test(threadId)) throw new Error(`thread_id must look like thr-042, got "${threadId}"`);
+        await readThread(root, threadId);
+      }
       const line = [
         `## ${nowIso()}`,
         '',
         `- reason: ${reason}`,
         args.blocked_on ? `- blocked on: ${clean(args.blocked_on, 300)}` : undefined,
-        args.thread_id ? `- thread: ${clean(args.thread_id, 40)}` : undefined,
+        threadId !== '' ? `- thread: ${threadId}` : undefined,
         args.next_action ? `- next action: ${clean(args.next_action, 300)}` : undefined,
         `- session: ${typeof exec?.agent?.id === 'string' ? exec.agent.id : '-'}`,
         '',
       ].filter((part) => part !== undefined).join('\n');
 
       const existing = await readIfExists(file);
-      const header = existing === undefined
-        ? '# Deferrals\n\nObstacles recorded instead of ending a goal. Newest last.\n\n'
+      // Entries are kept as one list so the cap drops the oldest rather than refusing new work.
+      const previousEntries = existing === undefined
+        ? []
+        : existing.split(/^(?=## )/m).filter((part) => part.startsWith('## '));
+      const entries = [...previousEntries, line];
+      const dropped = Math.max(0, entries.length - config.deferralsMaxEntries);
+      const kept = entries.slice(dropped);
+      const note = dropped > 0
+        ? `\n(${dropped} older entr${dropped === 1 ? 'y' : 'ies'} dropped at the ${config.deferralsMaxEntries}-entry cap.)\n`
         : '';
-      await writeAtomic(file, `${header}${existing ?? ''}${line}`);
+      await writeAtomic(
+        file,
+        `# Deferrals\n\nObstacles recorded instead of ending a goal. Newest last.\n${note}\n${kept.join('\n')}`,
+      );
 
       return [
         'recorded in research/DEFERRALS.md.',
@@ -1773,46 +1808,26 @@ function registerFinishTool(ctx, config) {
       const artifacts = (Array.isArray(args.artifacts) ? args.artifacts : []).map((a) => String(a).trim()).filter(Boolean);
       if (artifacts.length === 0) throw new Error('name at least one artifact that demonstrates the objective');
 
-      let base = process.cwd();
-      try {
-        const session = exec?.agent?.session;
-        const resolved = session === undefined ? undefined : ctx.workingDirectory.get(session);
-        if (typeof resolved === 'string' && resolved !== '') base = resolved;
-      } catch {
-        /* keep the fallback */
-      }
+      const base = sessionBase(ctx, exec);
 
-      const verified = [];
-      const missing = [];
-      for (const artifact of artifacts) {
-        if (/^thr-\d+$/.test(artifact)) {
-          // eslint-disable-next-line no-await-in-loop
-          const { parsed } = await readThread(root, artifact).catch(() => ({ parsed: undefined }));
-          if (parsed === undefined) missing.push(`${artifact} (no such thread)`);
-          else verified.push(`${artifact} (status ${String(parsed.frontmatter.status ?? 'unknown')})`);
-          continue;
-        }
-        const candidates = path.isAbsolute(artifact)
-          ? [artifact]
-          : [path.resolve(base, artifact), path.resolve(root, artifact)];
-        let found = false;
-        for (const candidate of candidates) {
-          // eslint-disable-next-line no-await-in-loop
-          if (await fs.access(candidate).then(() => true).catch(() => false)) {
-            found = true;
-            break;
-          }
-        }
-        if (found) verified.push(artifact);
-        else missing.push(artifact);
-      }
-
-      if (verified.length === 0) {
+      const { fingerprints, problems } = await fingerprintArtifacts(root, base, artifacts);
+      if (fingerprints.length === 0) {
         throw new Error(
-          `refusing to finish: none of the named artifacts exist (${missing.join(', ')}). `
+          `refusing to finish: none of the named artifacts exist (${problems.join(', ')}). `
           + 'The objective is not demonstrably done — keep working, or record what remains with vr_defer.',
         );
       }
+      // A thread demonstrates completion only when it reached a terminal or reportable state.
+      const notReportable = fingerprints.filter((item) => item.kind === 'thread' && item.gate === 'HOLD');
+      if (notReportable.length > 0) {
+        throw new Error(
+          `refusing to finish: ${notReportable.map((item) => item.name).join(', ')} is not report-ready (vr_gate says HOLD). `
+          + 'A thread that does not support its own claim cannot be the evidence that the objective was met.',
+        );
+      }
+      const verified = fingerprints.map((item) => (item.kind === 'thread'
+        ? `${item.name} (gate ${item.gate})`
+        : item.name));
 
       await writeAtomic(
         pendingFile(root),
@@ -1823,6 +1838,7 @@ function registerFinishTool(ctx, config) {
           summary,
           artifacts,
           verified,
+          fingerprints,
           created: nowIso(),
         }, null, 2),
       );
@@ -1900,6 +1916,25 @@ function registerFinishTool(ctx, config) {
 
       const view = goals.get(agent);
       if (view === undefined) throw new Error('the goal disappeared while awaiting verification');
+      const problem = completionClaimProblem(claim, view, {
+        nowMs: Date.now(),
+        maxAgeMs: config.completionClaimMinutes * 60000,
+      });
+      if (problem !== undefined) {
+        await fs.rm(file, { force: true });
+        throw new Error(`refusing this verdict: ${problem}. The stale claim has been discarded — call vr_finish_goal again if the goal is genuinely finished.`);
+      }
+      if (!Array.isArray(claim.fingerprints)) {
+        await fs.rm(file, { force: true });
+        throw new Error('refusing this verdict: the claim records no artifact fingerprints, so nothing says the files still hold what the verifier read. Call vr_finish_goal again.');
+      }
+      const artifactNames = (Array.isArray(claim.artifacts) ? claim.artifacts : []).map((item) => String(item)).filter(Boolean);
+      const rechecked = await fingerprintArtifacts(root, sessionBase(ctx, exec), artifactNames);
+      const drift = artifactFingerprintDrift(claim.fingerprints, rechecked.fingerprints);
+      if (drift.length > 0) {
+        await fs.rm(file, { force: true });
+        throw new Error(`refusing this verdict: ${drift.join('; ')}. The claim has been discarded — re-check the artifacts and claim again.`);
+      }
       const completed = goals.complete(agent, { id: view.id, revision: view.revision });
       await fs.rm(file, { force: true });
       return [
@@ -1944,7 +1979,10 @@ function registerScopeTools(ctx, config) {
       'Writes a provisional ENGAGEMENT.md that permits only the programme host, leaves confirmed',
       'false, and returns the brief for the scope-intake worker.',
     ].join(' '),
-    parameters: { url: { type: 'string', required: true, description: 'The programme or scope-page URL.' } },
+    parameters: {
+      url: { type: 'string', required: true, description: 'The programme or scope-page URL.' },
+      force: { type: 'boolean', description: 'Archive a qualified ENGAGEMENT.md and start again. Refused without it.' },
+    },
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const url = String(args.url).trim();
@@ -1959,6 +1997,26 @@ function registerScopeTools(ctx, config) {
       const slug = host.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
       const month = new Date().toISOString().slice(0, 7).replace('-', '');
       const engagementId = `${slug}-${month}`;
+
+      // Intake is idempotent only while nothing has been judged. Overwriting a qualified engagement
+      // destroys the judged scope and the decisions recorded against it, which is the record the
+      // entire boundary rests on.
+      const existing = await engagementDoc(root);
+      const alreadyQualified = existing !== undefined
+        && String(existing.frontmatter.confirmed ?? '').toLowerCase() === 'true';
+      if (alreadyQualified && args.force !== true) {
+        throw new Error(
+          `refusing intake: ${String(existing.frontmatter.engagement ?? engagementId)} is already qualified (confirmed: true). `
+          + 'Overwriting it would destroy the scope that was judged and the decisions recorded against it. '
+          + 'Pass force: true to archive the existing file first and start a new intake.',
+        );
+      }
+      if (alreadyQualified) {
+        const stamp = nowIso().replace(/[:.]/g, '-');
+        const previousText = await fs.readFile(path.join(root, 'ENGAGEMENT.md'), 'utf8');
+        await writeAtomic(path.join(root, `ENGAGEMENT.${stamp}.md`), previousText);
+      }
+
       const fm = {
         engagement: engagementId,
         programme: url,
@@ -1971,7 +2029,9 @@ function registerScopeTools(ctx, config) {
         updated: nowIso().slice(0, 10),
       };
       const sections = {
-        'In scope': 'Provisional: the programme page has not been read yet.',
+        // The marker is a line of its own so the status check can look for this tool's own output
+        // rather than for the word "provisional", which legitimate programme text also contains.
+        'In scope': 'Provisional: the programme page has not been read yet.\n\n<!-- vr-intake-pending -->',
         'Out of scope': 'Unknown until intake completes.',
         Policy: 'Unknown until intake completes.',
         'Scope decisions': `- ${nowIso()} intake started from ${url}`,
@@ -2808,7 +2868,7 @@ async function buildDashboardState(ctx, config) {
     if (parsed === undefined) continue;
     const fm = parsed.frontmatter;
     const evidenceStates = await evidenceStatesFor(root, id, parsed);
-    const gate = evaluateGate(parsed, evidenceStates);
+    const gate = evaluateGate(parsed, evidenceStates, gateOptions(config));
     const status = String(fm.status ?? 'unknown');
     const threadEngagement = String(fm.engagement ?? 'unscoped');
     if ((status === 'active' || status === 'untested') && threadEngagement === engagement) open += 1;
@@ -2909,6 +2969,157 @@ function registerDashboard(ctx, config) {
   }), 'dsh-vr dashboard route');
 }
 
+/** The workspace the researcher is working in; artifacts are named relative to it. */
+function sessionBase(ctx, exec) {
+  try {
+    const session = exec?.agent?.session;
+    const resolved = session === undefined ? undefined : ctx.workingDirectory.get(session);
+    if (typeof resolved === 'string' && resolved !== '') return resolved;
+  } catch {
+    /* fall through */
+  }
+  return process.cwd();
+}
+
+/**
+ * What a completion claim is a claim about, recorded now.
+ *
+ * Files are hashed so the verdict can tell whether they still say what the verifier read; threads are
+ * reduced to their gate decision for the same reason. A thread that is not report-ready cannot be
+ * the demonstration that an objective was met.
+ */
+async function fingerprintArtifacts(root, base, artifacts) {
+  const fingerprints = [];
+  const problems = [];
+  for (const artifact of artifacts) {
+    if (/^thr-\d+$/.test(artifact)) {
+      // eslint-disable-next-line no-await-in-loop
+      const { parsed } = await readThread(root, artifact).catch(() => ({ parsed: undefined }));
+      if (parsed === undefined) {
+        problems.push(`${artifact} (no such thread)`);
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const states = await evidenceStatesFor(root, artifact, parsed);
+      const gate = evaluateGate(parsed, states, gateOptions(config));
+      fingerprints.push({ name: artifact, kind: 'thread', gate: gate.decision });
+      continue;
+    }
+    const candidates = path.isAbsolute(artifact)
+      ? [artifact]
+      : [path.resolve(base, artifact), path.resolve(root, artifact)];
+    let bytes;
+    for (const candidate of candidates) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        bytes = await fs.readFile(candidate);
+        break;
+      } catch {
+        /* try the next location */
+      }
+    }
+    if (bytes === undefined) {
+      problems.push(artifact);
+      continue;
+    }
+    fingerprints.push({
+      name: artifact,
+      kind: 'file',
+      sha: createHash('sha256').update(bytes).digest('hex'),
+    });
+  }
+  return { fingerprints, problems };
+}
+
+/**
+ * Repair the inconsistencies the gate can detect but not fix.
+ *
+ * vr_evidence_add writes the evidence file before linking it, so a crash between the two leaves an
+ * orphan that nothing notices: the dashboard reports orphans and the gate cannot see a file it was
+ * never told about. This closes that loop, as a dry run unless the caller opts in.
+ */
+function registerRepairTool(ctx, config) {
+  ctx.tools.register(toolText({
+    name: 'vr_repair',
+    description: [
+      'Report and repair record inconsistencies: evidence files not linked from their thread, and',
+      'links that point at files that do not exist. A dry run unless apply is true.',
+      'Terminal threads are reported, never rewritten.',
+    ].join(' '),
+    parameters: {
+      apply: { type: 'boolean', description: 'Write the repairs. Omit for a dry run that only reports.' },
+    },
+    async run(args, exec) {
+      const root = await researchRoot(ctx, config, exec);
+      const apply = args.apply === true;
+      const repaired = [];
+      const report = [];
+      for (const id of await listThreadIds(root)) {
+        // eslint-disable-next-line no-await-in-loop
+        const { parsed } = await readThread(root, id).catch(() => ({ parsed: undefined }));
+        if (parsed === undefined) continue;
+        const dir = threadDir(root, id);
+        const status = String(parsed.frontmatter.status ?? '');
+        const terminal = status === 'closed' || status === 'refuted';
+        const links = evidenceLinks(parsed.sections);
+        const linked = new Set(links.map((link) => link.path));
+        // eslint-disable-next-line no-await-in-loop
+        const files = (await fs.readdir(path.join(dir, 'evidence')).catch(() => []))
+          .filter((file) => /^E-\d+\.md$/.test(file))
+          .sort();
+        const unlinked = files.filter((file) => !linked.has(`evidence/${file}`));
+        const missing = [];
+        for (const link of links) {
+          // eslint-disable-next-line no-await-in-loop
+          const exists = await fs.access(path.join(dir, link.path)).then(() => true).catch(() => false);
+          if (!exists) missing.push(`${link.id} -> ${link.path}`);
+        }
+        if (missing.length > 0) {
+          report.push(`${id}: ${missing.length} link(s) point at files that do not exist: ${missing.join(', ')}`);
+        }
+        if (unlinked.length === 0) continue;
+        if (terminal) {
+          report.push(`${id}: ${unlinked.length} unlinked evidence file(s), left alone because the thread is ${status}: ${unlinked.join(', ')}`);
+          continue;
+        }
+        const bullets = [];
+        for (const file of unlinked) {
+          // eslint-disable-next-line no-await-in-loop
+          const text = await readIfExists(path.join(dir, 'evidence', file));
+          const evidence = text === undefined ? undefined : parseStateFile(text);
+          const evidenceId = file.replace(/\.md$/, '');
+          const title = String(evidence?.title ?? evidenceId);
+          bullets.push(`- [${evidenceId}: ${clip(title, 120)}](evidence/${file})`);
+        }
+        if (apply) {
+          const existing = String(parsed.sections.Evidence ?? '').trim();
+          const isEmpty = existing === '' || existing === 'none';
+          parsed.sections.Evidence = isEmpty ? bullets.join('\n') : `${existing}\n${bullets.join('\n')}`;
+          // eslint-disable-next-line no-await-in-loop
+          await writeAtomic(path.join(dir, 'index.md'), renderThread(parsed.frontmatter, parsed.sections));
+        }
+        repaired.push(`${id}: ${bullets.length} evidence file(s) ${apply ? 'linked' : 'would be linked'}: ${unlinked.join(', ')}`);
+      }
+      if (apply && repaired.length > 0) await regenerateIndex(root);
+      if (repaired.length === 0 && report.length === 0) return 'no inconsistencies found between threads and their evidence files.';
+      return [
+        ...repaired,
+        ...report,
+        '',
+        apply ? 'Repairs written; INDEX.md regenerated.' : 'Dry run only. Call again with apply: true to write these repairs.',
+        report.length > 0 ? 'Items in the report list need a decision, not a rewrite.' : '',
+      ].filter(Boolean).join('\n');
+    },
+  }));
+}
+
+/** Gate options that come from config, resolved in one place so every caller agrees. */
+function gateOptions(config) {
+  return {
+    minTier: String(config.minReportTier ?? '').trim().toLowerCase(),
+  };
+}
+
 function apply(ctx, config) {
   if (!config.enabled) return;
   registerStateTools(ctx, config);
@@ -2921,6 +3132,7 @@ function apply(ctx, config) {
   registerFanoutTool(ctx, config);
   registerContextTool(ctx, config);
   registerFinishTool(ctx, config);
+  registerRepairTool(ctx, config);
   if (config.telemetry) registerTelemetry(ctx, config);
   registerBoundaryGuard(ctx, config);
   registerStateEnrichment(ctx, config);

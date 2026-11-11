@@ -22,6 +22,9 @@ Investigation: `vr_scan`, `vr_scan_eval`.
 Operator and orchestration: `ask_operator`, `vr_defer`, `vr_fanout`, `vr_context`, `vr_finish_goal`,
 `vr_completion_decide`.
 
+Maintenance: `vr_repair` reports evidence files that were never linked into their thread and links
+that point at files that do not exist; it is a dry run unless called with `apply: true`.
+
 `vr_gate` returns exactly one of `REPORT`, `HOLD`, `REFUTE`, `CLOSED`. Only `REPORT` means the thread
 may be drafted into a finding.
 
@@ -38,12 +41,21 @@ Two modes, and they are not equivalent:
 
 Both modes are audited: allowed and refused calls are written to the telemetry ledger with the host.
 
+What neither mode can do is enforced anywhere but at dispatch time. An HTTP redirect is followed after
+the check, so an allowed host that redirects to a denied one is reached; DNS resolves after the check,
+so a denied host named by IP address or reached through a CNAME is not recognised. Only a
+network-level egress control closes that class, and this plugin does not pretend to be one.
+
 ## Scope
 
 Scope is content observed through a tool, and observed content cannot authorise anything. The intake
-worker reads the programme page; the judge must fetch that page itself and quote the hosts it finds.
-An approved expansion merges hosts into `allowed_hosts`; it never qualifies an engagement that was not
-qualified by its own verdict.
+worker reads the programme page; the judge must fetch that page itself and answer with a line
+`Hosts read on the page: ...`. Approval is refused unless every host in `allowed_hosts` is covered by
+that list, so an injected instruction has to be repeated consistently in two tools, in a list the
+researcher can diff against the page. An approved expansion merges the requested hosts into
+`allowed_hosts`; it never qualifies an engagement that was not qualified by its own verdict.
+`vr_scope_intake` refuses to overwrite an engagement that is already qualified unless `force: true`,
+which archives the previous file first.
 
 ## Telling the operator apart from the content
 
@@ -66,11 +78,35 @@ that fails to register — or a config key that does not exist — fails here in
 Copy `cordis.patch.example.yml` to `cordis.patch.yml` and edit the paths. The real patch file is
 gitignored because it names a specific engagement workspace and denied hosts.
 
+Values that change what the gate believes, beyond the defaults:
+
+- `completionClaimMinutes` (60) — a completion claim older than this is refused, so a forgotten claim
+  cannot complete a goal that appeared later.
+- `minReportTier` (`""`) — when set to `component` or `system`, executed evidence below that tier
+  cannot support a `REPORT`.
+- `requireExecutionAttestation` (`false`) — when true, executed evidence that the telemetry ledger
+  cannot tie to a finished tool call blocks instead of being reported as a caveat.
+- `allowLoopback`, `referenceHosts`, `deniedHosts`, `enforceAllowedHosts` — see the boundary section.
+- `dashboardAllowHosts`, `dashboardCacheMs` — the dashboard is served only to loopback Host headers.
+
+`research/threads/INDEX.md` is derived state: it is regenerated after every write and is never read
+back as evidence, so a crash that leaves it stale costs nothing but a regeneration.
+
+## Residual risk
+
+The gate verifies records, not reality. Nothing in it can stop an agent that wants a `REPORT` from
+writing a convincing `vr_evidence_add` claiming `kind: execution` with an invented observed response.
+What exists is a chain of consistency checks — the record must name a session, that session must show
+a finished tool call, cited artifacts are hashed at record time, attribution must cite executed
+evidence, revalidation must name a revision, and the completion claim must match the goal it was made
+about. Each raises the cost of a false claim; none of them observes the target.
+
 ## Known gaps
 
-- `vr_finish_goal` / `vr_completion_decide` are honour-system: the verdict is whatever the caller
-  records. They detect a self-contradictory claim, not a dishonest one.
-- State files are rewritten atomically but not fsynced.
+- `vr_completion_decide` records whatever verdict the caller reports. It now refuses a claim made about
+  a different goal, an expired claim, or artifacts that changed after the claim — but it cannot tell a
+  dishonest verifier from an honest one.
 - `vr_scan` compiles agent-supplied regular expressions with the default engine; a pathological
   pattern can be slow.
 - Thread and evidence ids are allocated by reading the directory; concurrent tool calls can race.
+- The boundary guard refuses at dispatch time only; redirects and DNS resolution happen afterwards.

@@ -1,4 +1,5 @@
 *.log
+.DS_Store
 cordis.patch.yml
 node_modules/
 # Created if the plugin is loaded from this directory rather than the workspace.
