@@ -109,6 +109,15 @@ An approved expansion merges only the requested hosts, and never qualifies an en
 qualified by its own verdict. Intake refuses to overwrite an engagement that is already qualified
 unless called with `force: true`, which archives the previous file first.
 
+`ENGAGEMENT.md` is written from text copied off a programme page, so none of that text is allowed to
+become structure. Every frontmatter value is folded to one line (LF, CR, CRLF, U+2028, U+2029, NEL and
+the other control characters), which is what keeps a field from carrying its own `confirmed: true`.
+Free text in a section has any line that would read as a heading, a title or a code fence escaped
+with a backslash. A scope entry must be one bare host — `acme.test`, `*.acme.test`, `acme.test:8443`,
+an IP literal — and anything else is refused rather than repaired, so the judge is never shown a
+different string from the one that was stored. An expansion merges only the hosts on the request's
+own leading `requested host:` lines, not hosts its justification or evidence text mentions.
+
 ## Boundary enforcement — read this before trusting it
 
 Two modes, and they are not equivalent:
@@ -217,9 +226,11 @@ goal. Each raises the cost of a false claim; none observes the target.
 
 These are real and unfixed as of this commit:
 
-- `vr_scope_apply` writes frontmatter values without folding newlines. A newline inside a field can
-  inject frontmatter keys, including `confirmed: true`, which would qualify a scope without a judge.
-  Treat scope writes as untrusted until this is fixed.
+- `ENGAGEMENT.md` is an ordinary file in the workspace. The scope tools can no longer be steered into
+  writing `confirmed: true`, but an agent with a shell or a file-write tool can still write it
+  directly: nothing binds the stored verdict to the judge that gave it, and the boundary guard reads
+  the same file. Until the verdict is signed or kept outside the agent's reach, a qualified scope
+  means "the file says so", not "a judge said so".
 - Thread and evidence ids are allocated by reading the directory; concurrent tool calls can race and
   both claim the same id.
 - `vr_evidence_classify`, `vr_attempt`, `vr_attribution` and `vr_revalidate` still accept writes to

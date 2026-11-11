@@ -1,6 +1,20 @@
 # Changelog
 
 ## Unreleased
+- Scope writes can no longer be steered by the text they record. A line break inside a
+  `vr_scope_apply` field used to be written raw, so `authorization: "…\nconfirmed: true\n---"`
+  qualified a scope with no judge. `renderEngagement` is now the one writer of `ENGAGEMENT.md` and
+  folds every frontmatter value to a single line whatever the caller passed; section text has
+  heading, title and fence lines escaped, so `rules_note` or an `out_of_scope` rule cannot add a
+  `Scope decisions` or `Pending scope request` section, and a judge's rationale cannot continue as a
+  second, forged verdict line.
+- `allowed_hosts` and `requested_hosts` entries must each be one bare host (optional `*.` prefix and
+  port; IP literals accepted). Entries holding whitespace, a comma, a scheme or path, a trailing dot,
+  an empty label or non-ASCII characters are refused with the reason, not rewritten.
+- An approved expansion reads the requested hosts from the leading `requested host:` lines of the
+  pending request only; a host line quoted further down in its justification or evidence is ignored.
+- `vr_scope_intake` refuses a URL that contains whitespace or control characters instead of letting
+  the URL parser drop them silently.
 - Findings panel: aborts an in-flight read when it unmounts, reports a failed read instead of going
   blank, shows when it last succeeded, isolates a table that fails to render behind an error
   boundary, and can blur finding text for screen sharing.

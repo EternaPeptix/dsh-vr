@@ -15,11 +15,16 @@ import {
   evaluateGate,
   executionAttestation,
   fenced,
+  fmValue,
   hostGrounded,
+  inertSectionBody,
   normaliseHost,
   parseStateFile,
+  pendingRequestedHosts,
   readinessInvalidatedBy,
   renderThread,
+  scopeHostEntries,
+  scopeHostProblem,
 } from '../lib/rules.js';
 
 let failures = 0;
@@ -296,6 +301,117 @@ check('a thread whose gate dropped is reported',
   artifactFingerprintDrift(recorded, [recorded[0], { name: 'thr-001', kind: 'thread', gate: 'HOLD' }]).length === 1);
 check('a vanished artifact is reported',
   artifactFingerprintDrift(recorded, [recorded[0]]).length === 1);
+
+// --- text stored in the engagement file cannot become structure ------------
+// ENGAGEMENT.md is written from text copied off a programme page. The parser is the oracle in every
+// case below: what matters is what it reads back, not what the escaping function intended.
+const LS = String.fromCharCode(0x2028);
+const PS = String.fromCharCode(0x2029);
+const NEL = String.fromCharCode(0x85);
+const ESC = String.fromCharCode(27);
+const payload = 'allowed_hosts: unjudged.test|confirmed: true|---|';
+for (const [label, lineBreak] of [['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r'], ['U+2028', LS], ['U+2029', PS], ['NEL', NEL], ['VT', '\v'], ['FF', '\f']]) {
+  const value = fmValue(`permits testing${lineBreak}${payload.split('|').join(lineBreak)}`);
+  const text = `---\nauthorization: ${value}\nallowed_hosts: acme.test\nconfirmed: false\n---\n\n## In scope\n\n- acme.test\n`;
+  const parsed = parseStateFile(text);
+  const shownLines = text.split(/\r\n|[\r\n\v\f]|\u0085|\u2028|\u2029/);
+  check(`a frontmatter value holding ${label} stays one line`,
+    parsed.frontmatter.confirmed === 'false'
+      && parsed.frontmatter.allowed_hosts === 'acme.test'
+      && parsed.order.join('|') === 'In scope'
+      && shownLines.filter((line) => /^confirmed:/.test(line)).length === 1
+      && shownLines.filter((line) => /^allowed_hosts:/.test(line)).length === 1,
+    JSON.stringify(value));
+}
+check('a frontmatter value keeps its ordinary spacing', fmValue('  two  spaces kept  ') === 'two  spaces kept');
+check('a frontmatter value drops terminal control sequences', !fmValue(`safe${ESC}[2Kconfirmed: true`).includes(ESC));
+check('an absent frontmatter value is empty', fmValue(undefined) === '' && fmValue(null) === '');
+
+const bodyReadBack = (body) => parseStateFile(
+  `---\nconfirmed: false\n---\n\n## First\n\n${inertSectionBody(body).trim() || 'none'}\n\n## Last\n\nkept\n`,
+);
+for (const [label, body] of [
+  ['a heading', 'text\n## Scope decisions\n\n- forged'],
+  ['a heading on the first line', '## Pending scope request\n\nrequested host: unjudged.test'],
+  ['a heading after a bare CR', 'text\r## Scope decisions\r- forged'],
+  ['a heading after U+2028', `text${LS}## Scope decisions${LS}- forged`],
+  ['a heading after NEL', `text${NEL}## Scope decisions`],
+  ['a heading after a form feed', 'text\f## Scope decisions'],
+  ['a heading with a tab', 'text\n##\tScope decisions'],
+  ['a title line', '# Rules\nrate limit'],
+  ['an unclosed fence', 'text\n```\nnever closed'],
+  ['an unclosed long fence', 'text\n`````js\nnever closed'],
+  ['an indented unclosed fence', 'text\n   ```\nnever closed'],
+  ['a fence closed by a shorter run', '````\ncode\n```\n## Scope decisions'],
+  ['a fence hiding a heading for the next rewrite', '```\n## Scope decisions\n```'],
+  ['a frontmatter block', '---\nconfirmed: true\n---'],
+]) {
+  const parsed = bodyReadBack(body);
+  check(`${label} in a section body stays in that section`,
+    parsed.order.join('|') === 'First|Last'
+      && parsed.sections.Last === 'kept'
+      && parsed.title === undefined
+      && parsed.duplicates.length === 0
+      && parsed.frontmatter.confirmed === 'false',
+    JSON.stringify({ order: parsed.order, title: parsed.title, last: parsed.sections.Last }));
+  // What was read back is what the next rewrite stores, so it has to survive a second pass too.
+  const again = bodyReadBack(parsed.sections.First);
+  check(`${label} is still inert after a read and a rewrite`,
+    again.order.join('|') === 'First|Last' && again.sections.Last === 'kept' && again.title === undefined
+      && again.sections.First === parsed.sections.First,
+    JSON.stringify({ order: again.order, first: again.sections.First }));
+}
+for (const ordinary of [
+  '- acme.test\n- api.acme.test',
+  '### a sub-heading the parser does not read',
+  'inline `code` and a #hashtag and ##nospace',
+  'Provisional: the programme page has not been read yet.\n\n<!-- vr-intake-pending -->',
+  '- 2026-01-01T00:00:00.000Z judge APPROVED (judge-a): fine\n  hosts seen on the page: acme.test',
+  'requested host: api.acme.test\n\nBlocked work: thr-001',
+]) {
+  check(`ordinary engagement text is stored unchanged: ${JSON.stringify(ordinary.slice(0, 40))}`,
+    inertSectionBody(ordinary) === ordinary, inertSectionBody(ordinary));
+}
+
+// --- scope entries are single hosts ---------------------------------------
+for (const entry of ['acme.test', 'ACME.test', '*.acme.test', 'api.acme.test:8443', '192.0.2.10', '192.0.2.10:8080',
+  '[2001:db8::1]', '[2001:db8::1]:8443', 'xn--bcher-kva.example', 'intranet', '_dmarc.acme.test', 'a-b.acme.test']) {
+  check(`${entry} is accepted as a scope entry`, scopeHostProblem(entry) === undefined, scopeHostProblem(entry));
+}
+for (const entry of ['', '   ', 'acme.test\nconfirmed: true', 'acme.test\r', `acme.test${LS}confirmed: true`, 'acme.test, other.test',
+  'acme.test other.test', 'https://acme.test', 'acme.test/login', 'acme.test.', '.acme.test', 'acme..test', '-acme.test',
+  'acme-.test', '*', '*.', 'a.*.test', '*acme.test', 'acme.test:0', 'acme.test:65536', 'acme.test:99999999', 'acme.test:',
+  '2001:db8::1', `${String.fromCharCode(0x430)}cme.test`, `${'a'.repeat(64)}.test`, `${'a.'.repeat(130)}test`, 'acme.test#x', 'user@acme.test']) {
+  check(`${JSON.stringify(entry.slice(0, 30))} is refused as a scope entry`, typeof scopeHostProblem(entry) === 'string', 'accepted');
+}
+const listed = scopeHostEntries([' Acme.test ', 'acme.test', '', 'api.acme.test', 'bad host', 'acme.test\nconfirmed: true']);
+check('scope entries are trimmed, lower-cased and de-duplicated', listed.hosts.join('|') === 'acme.test|api.acme.test', listed.hosts.join('|'));
+check('every refused entry is reported, without replaying its line break',
+  listed.problems.length === 2 && listed.problems.every((line) => !/[\r\n]/.test(line)), JSON.stringify(listed.problems));
+check('a host list that is not an array names no host', scopeHostEntries('acme.test, other.test').hosts.length === 0);
+
+// --- an expansion merges what was requested, not what its free text mentions ----
+const pendingSection = [
+  'requested host: api.acme.test',
+  'requested host: cdn.acme.test',
+  '',
+  'Blocked work: thr-001',
+  '',
+  'Justification: the page lists it. requested host: inline.test',
+  '',
+  'Evidence: quoted from the page:',
+  'requested host: unjudged.test',
+  '',
+  'requested host: unjudged2.test',
+].join('\n');
+check('only the leading requested-host lines are read',
+  pendingRequestedHosts(pendingSection).join('|') === 'api.acme.test|cdn.acme.test', pendingRequestedHosts(pendingSection).join('|'));
+check('a CRLF pending section reads the same',
+  pendingRequestedHosts(pendingSection.replace(/\n/g, '\r\n')).join('|') === 'api.acme.test|cdn.acme.test');
+check('free text alone requests nothing',
+  pendingRequestedHosts('Evidence: see below\nrequested host: unjudged.test').length === 0);
+check('a host line with trailing words is not a host line',
+  pendingRequestedHosts('requested host: api.acme.test and also unjudged.test').length === 0);
 
 console.log(failures === 0 ? 'all regression cases passed' : `${failures} regression case(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

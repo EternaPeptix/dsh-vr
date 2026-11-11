@@ -713,9 +713,114 @@ export function fenced(content, lang = 'text') {
   return `${fence}${lang}\n${body}\n${fence}`;
 }
 
-/** A newline in a frontmatter value would be read back as another key. */
+/**
+ * A line break in a frontmatter value would be read back as another key.
+ *
+ * Every character a reader may show as a line break is folded, not only the `\n` the parser splits
+ * on: a bare CR or U+2028 leaves the parse intact while the file displays a `confirmed: true` line
+ * that the person reviewing it cannot tell from a real one. The remaining control characters go the
+ * same way, because a terminal acts on them.
+ */
+const LINE_BREAK_OR_CONTROL = /[\u0000-\u001f\u007f\u0085\u2028\u2029]+/;
 export function fmValue(value) {
-  return String(value ?? '').replace(/\s*\n\s*/g, ' ').trim();
+  return String(value ?? '')
+    .split(LINE_BREAK_OR_CONTROL)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(' ');
+}
+
+/**
+ * Why a scope entry cannot be recorded, or undefined when it can.
+ *
+ * `allowed_hosts` is stored as one comma-separated frontmatter line and read back by splitting it,
+ * so an entry has to be a single token that reads back as exactly itself: no whitespace, no comma,
+ * no line break. Beyond that it has to be something a hostname can be compared with — `host`,
+ * `*.host`, either with `:port`, or an IP literal. A URL is refused rather than trimmed to its host:
+ * recording a different string from the one that was judged is how a scope drifts.
+ */
+const HOST_LABEL = '[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?';
+const SCOPE_HOSTNAME = new RegExp(`^(?:\\*\\.)?${HOST_LABEL}(?:\\.${HOST_LABEL})*$`);
+const SCOPE_IPV6 = /^\[[0-9a-f:.]{2,45}\]$/;
+export function scopeHostProblem(entry) {
+  const text = String(entry ?? '').toLowerCase();
+  if (text.trim() === '') return 'is empty';
+  if (/[\s\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(text)) return 'contains whitespace or a line break';
+  if (text.includes(',')) return 'contains a comma; pass each host as its own entry';
+  if (/[^\x21-\x7e]/.test(text)) return 'contains non-ASCII characters; pass the punycode (xn--) form';
+  if (text.includes('/')) return 'is a URL or carries a path; pass the bare host';
+  const port = /:(\d+)$/.exec(text);
+  if (port !== null && (port[1].length > 5 || Number(port[1]) < 1 || Number(port[1]) > 65535)) {
+    return 'has a port outside 1-65535';
+  }
+  const host = port === null ? text : text.slice(0, port.index);
+  if (host.length > 253) return 'is longer than a hostname can be';
+  if (!SCOPE_HOSTNAME.test(host) && !SCOPE_IPV6.test(host)) {
+    return 'is not a bare host: expected host, *.host, host:port or an IP literal (IPv6 in brackets)';
+  }
+  return undefined;
+}
+
+/**
+ * Normalise a tool's host array into the entries to store and the reasons any were refused.
+ * Entries are trimmed, lower-cased and de-duplicated; nothing else about them is rewritten.
+ */
+export function scopeHostEntries(values) {
+  const hosts = [];
+  const problems = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    const entry = String(value ?? '').trim().toLowerCase();
+    if (entry === '') continue;
+    const problem = scopeHostProblem(entry);
+    if (problem !== undefined) {
+      // Quoted through JSON so a refused line break is shown as `\n`, not replayed into the reply.
+      problems.push(`${JSON.stringify(entry.length > 80 ? `${entry.slice(0, 80)}…` : entry)} ${problem}`);
+    } else if (!hosts.includes(entry)) {
+      hosts.push(entry);
+    }
+  }
+  return { hosts, problems };
+}
+
+/**
+ * The hosts a pending scope request asks for.
+ *
+ * Only the leading run of `requested host:` lines counts. The rest of the section is free text —
+ * the justification and the programme text quoted as evidence — and reading host lines out of it
+ * let a quoted sentence add a host the judge was never shown as requested.
+ */
+export function pendingRequestedHosts(sectionText) {
+  const hosts = [];
+  for (const line of String(sectionText ?? '').replace(/\r\n/g, '\n').trim().split('\n')) {
+    const match = /^requested host:\s*(\S+)\s*$/i.exec(line);
+    if (match === null) break;
+    hosts.push(match[1]);
+  }
+  return hosts;
+}
+
+/**
+ * Make free text safe to store as the body of a `## ` section that is not fenced.
+ *
+ * Thread and evidence sections are fenced on write. The engagement file is not: it is the one state
+ * file an operator reads and edits as prose, so its bodies stay plain and only the lines the parser
+ * would read as structure are escaped — a `## ` heading, the `# ` title, and a fence, which would
+ * otherwise swallow every heading after it. The backslash keeps the text readable (Markdown renders
+ * it as the literal character) and stops the line matching on the next read, so the escape is stable
+ * across rewrites. Whatever a reader may show as a line break is normalised to `\n` first, so the
+ * parser and the person see the same lines.
+ *
+ * The three patterns mirror parseStateFile; test/regressions.test.mjs checks the result against the
+ * parser itself, so a new structural line there fails here instead of drifting.
+ */
+const STRUCTURAL_LINE = /^(?:#{1,2}[ \t]+\S|\s*`{3,})/;
+export function inertSectionBody(text) {
+  return String(text ?? '')
+    .replace(/\r\n?|[\u000b\u000c\u0085\u2028\u2029]/g, '\n')
+    .replace(/[\u0000-\u0008\u000e-\u001f\u007f]/g, '')
+    .split('\n')
+    .map((line) => (STRUCTURAL_LINE.test(line) ? `\\${line}` : line))
+    .join('\n');
 }
 
 /**

@@ -51,6 +51,10 @@ import {
   executionAttestation,
   completionClaimProblem,
   artifactFingerprintDrift,
+  scopeHostEntries,
+  scopeHostProblem,
+  pendingRequestedHosts,
+  inertSectionBody,
 } from './rules.js';
 
 const name = 'dsh-vr';
@@ -260,15 +264,25 @@ async function scopeProblems(root) {
   return problems;
 }
 
+/**
+ * The only writer of ENGAGEMENT.md.
+ *
+ * Every value is made inert here, whatever the caller did to it: this file decides what may be
+ * contacted, most of what it stores is text copied off a programme page, and a value that reached
+ * it verbatim could carry a line break followed by `confirmed: true` and a closing `---` — a scope
+ * that qualified itself with no judge. Frontmatter values are folded to one line; section bodies
+ * keep their lines but cannot start a heading, a title or a fence.
+ */
 function renderEngagement(fm, sections) {
   const order = ['engagement', 'programme', 'target', 'revision', 'authorization', 'allowed_hosts', 'concurrency', 'confirmed', 'updated'];
   const lines = ['---'];
   for (const key of order) {
-    if (fm[key] !== undefined && fm[key] !== '') lines.push(`${key}: ${fm[key]}`);
+    const value = fmValue(fm[key]);
+    if (value !== '') lines.push(`${key}: ${value}`);
   }
   lines.push('---', '');
   for (const [heading, text] of Object.entries(sections)) {
-    lines.push(`## ${heading}`, '', String(text).trim() || 'none', '');
+    lines.push(`## ${fmValue(heading)}`, '', inertSectionBody(text).trim() || 'none', '');
   }
   return `${lines.join('\n').trimEnd()}\n`;
 }
@@ -1993,6 +2007,11 @@ function registerScopeTools(ctx, config) {
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const url = String(args.url).trim();
+      // The URL parser drops tabs and line breaks without complaint, so a URL that carries them
+      // parses as valid while the string stored and briefed below is a different one.
+      if (/[\s\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(url)) {
+        throw new Error('url must not contain whitespace, line breaks or control characters');
+      }
       let parsed;
       try {
         parsed = new URL(url);
@@ -2067,7 +2086,7 @@ function registerScopeTools(ctx, config) {
       programme: { type: 'string', required: true, description: 'Programme name as the page states it.' },
       target: { type: 'string', required: true, description: 'Primary asset under test.' },
       authorization: { type: 'string', required: true, description: 'One sentence naming the programme and what it permits.' },
-      allowed_hosts: { type: 'array', items: { type: 'string' }, required: true, description: 'Every host an authorised test may contact.' },
+      allowed_hosts: { type: 'array', items: { type: 'string' }, required: true, description: 'Every host an authorised test may contact, one bare host per entry (acme.test, *.acme.test, acme.test:8443): no scheme, path, spaces or commas.' },
       out_of_scope: { type: 'array', items: { type: 'string' }, description: 'Exclusions and forbidden techniques.' },
       rules_note: { type: 'string', description: 'Rate limits, credential rules, disclosure constraints.' },
       revision: { type: 'string', description: 'Target revision or release under scope.' },
@@ -2075,16 +2094,24 @@ function registerScopeTools(ctx, config) {
     async run(args, exec) {
       const root = await researchRoot(ctx, config, exec);
       const doc0 = await engagementDoc(root);
-      const hosts = (Array.isArray(args.allowed_hosts) ? args.allowed_hosts : [])
-        .map((host) => String(host).trim().toLowerCase())
-        .filter(Boolean);
+      // Refused, not repaired: an entry that is not one bare host would be stored as a different
+      // string from the one the judge is then shown.
+      const { hosts, problems: hostProblems } = scopeHostEntries(args.allowed_hosts);
+      if (hostProblems.length > 0) {
+        throw new Error([
+          `refusing to record the scope: allowed_hosts entry ${hostProblems.join('; allowed_hosts entry ')}.`,
+          'Pass each host as its own entry, written as a bare host the way the programme page lists it. Nothing was written.',
+        ].join(' '));
+      }
       if (hosts.length === 0) throw new Error('allowed_hosts must name at least one host');
+      // Folded to one line here as well as in renderEngagement, so the comparison with the stored
+      // scope and the brief handed to the judge both use exactly what the file will hold.
       const fm = {
-        engagement: clean(args.engagement, 80),
-        programme: clean(args.programme, 200),
-        target: clean(args.target, 200),
-        revision: clean(args.revision ?? '', 200),
-        authorization: clean(args.authorization, 400),
+        engagement: fmValue(clean(args.engagement, 80)),
+        programme: fmValue(clean(args.programme, 200)),
+        target: fmValue(clean(args.target, 200)),
+        revision: fmValue(clean(args.revision ?? '', 200)),
+        authorization: fmValue(clean(args.authorization, 400)),
         allowed_hosts: hosts.join(', '),
         // Written from the configured ceiling so the file states the limit that applies.
         concurrency: String(config.maxActiveThreads),
@@ -2093,7 +2120,12 @@ function registerScopeTools(ctx, config) {
       };
       const sections = {
         'In scope': hosts.map((host) => `- ${host}`).join('\n'),
-        'Out of scope': (Array.isArray(args.out_of_scope) ? args.out_of_scope : []).map((rule) => `- ${clean(rule, 300)}`).join('\n') || 'not stated',
+        // One rule per list item: a rule that spans lines would read as several entries nobody passed.
+        'Out of scope': (Array.isArray(args.out_of_scope) ? args.out_of_scope : [])
+          .map((rule) => fmValue(clean(rule, 300)))
+          .filter(Boolean)
+          .map((rule) => `- ${rule}`)
+          .join('\n') || 'not stated',
         Policy: clean(args.rules_note ?? '', 4000) || 'not stated',
         'Scope decisions': `- ${nowIso()} scope recorded from the programme page; awaiting judge`,
       };
@@ -2171,9 +2203,9 @@ function registerScopeTools(ctx, config) {
       // Comparisons use normalised hostnames; what is written back keeps the entries as recorded, so
       // an approval cannot quietly rewrite a scoped port or a wildcard into its bare domain.
       const existingRaw = String(fm.allowed_hosts ?? '').split(',').map((host) => host.trim()).filter(Boolean);
-      const requestedRaw = isExpansion
-        ? [...pending.matchAll(/requested host:\s*(\S+)/gi)].map((match) => match[1].trim()).filter(Boolean)
-        : [];
+      // Read from the request's own leading lines only: the free text below them quotes the
+      // programme page, and a host line found there was never shown to the judge as requested.
+      const requestedRaw = isExpansion ? pendingRequestedHosts(pending) : [];
       const existingHosts = existingRaw.map(normaliseHost).filter(Boolean);
       const requestedHosts = requestedRaw.map(normaliseHost).filter(Boolean);
       const prospectiveHosts = [...new Set([...existingHosts, ...requestedHosts])];
@@ -2186,6 +2218,22 @@ function registerScopeTools(ctx, config) {
         ? []
         : declaredLine[1].split(/[,;\s]+/).map(normaliseHost).filter(Boolean);
 
+      if (approved && isExpansion) {
+        // An approval that merges nothing, or merges an entry that does not read back as one host,
+        // would still be recorded as a judged expansion.
+        const unreadable = requestedRaw
+          .map((host) => [host, scopeHostProblem(host)])
+          .filter(([, problem]) => problem !== undefined)
+          .map(([host, problem]) => `${JSON.stringify(clip(host, 80))} ${problem}`);
+        if (requestedRaw.length === 0 || unreadable.length > 0) {
+          throw new Error([
+            requestedRaw.length === 0
+              ? 'refusing to approve: the pending request names no host on its leading "requested host:" lines.'
+              : `refusing to approve: the pending request names ${unreadable.join('; ')}.`,
+            'Reject it (approved: false) to clear it, then file the request again with vr_scope_request.',
+          ].join(' '));
+        }
+      }
       if (approved) {
         // Structural defence against a page that argues for its own authorisation: the judge must
         // enumerate the hosts it actually read, and nothing may enter allowed_hosts that is not
@@ -2245,7 +2293,9 @@ function registerScopeTools(ctx, config) {
         : [];
       sections['Scope decisions'] = [
         decisions,
-        `- ${nowIso()} judge ${approved ? 'APPROVED' : 'REJECTED'}${args.judge ? ` (${clean(args.judge, 80)})` : ''}: ${clean(args.rationale, 600)}${seenLine}`,
+        // One verdict, one entry: the judge name and the rationale are folded to a single line so
+        // neither can continue as a second `- <time> judge APPROVED` entry that no verdict produced.
+        `- ${nowIso()} judge ${approved ? 'APPROVED' : 'REJECTED'}${args.judge ? ` (${fmValue(clean(args.judge, 80))})` : ''}: ${fmValue(clean(args.rationale, 600))}${seenLine}`,
         narrowed.length > 0
           ? `  not tested although the page lists them: ${narrowed.join(', ')}`
           : '',
@@ -2267,7 +2317,7 @@ function registerScopeTools(ctx, config) {
       'Records the request as pending and returns the brief for a judge.',
     ].join(' '),
     parameters: {
-      requested_hosts: { type: 'array', items: { type: 'string' }, required: true, description: 'Hosts being requested.' },
+      requested_hosts: { type: 'array', items: { type: 'string' }, required: true, description: 'Hosts being requested, one bare host per entry: no scheme, path, spaces or commas.' },
       blocked_work: { type: 'string', required: true, description: 'Which experiment or thread cannot proceed without this.' },
       justification: { type: 'string', required: true, description: 'Why the programme scope genuinely includes it.' },
       evidence: { type: 'string', required: true, description: 'The programme text or policy that supports the claim.' },
@@ -2277,9 +2327,13 @@ function registerScopeTools(ctx, config) {
       const root = await researchRoot(ctx, config, exec);
       const doc = await engagementDoc(root);
       if (doc === undefined) throw new Error('no ENGAGEMENT.md exists');
-      const hosts = (Array.isArray(args.requested_hosts) ? args.requested_hosts : [])
-        .map((host) => String(host).trim().toLowerCase())
-        .filter(Boolean);
+      const { hosts, problems: hostProblems } = scopeHostEntries(args.requested_hosts);
+      if (hostProblems.length > 0) {
+        throw new Error([
+          `refusing to record the request: requested_hosts entry ${hostProblems.join('; requested_hosts entry ')}.`,
+          'Pass each host as its own entry, written as a bare host. Nothing was written.',
+        ].join(' '));
+      }
       if (hosts.length === 0) throw new Error('requested_hosts must name at least one host');
       const fm = doc.frontmatter;
       const sections = doc.sections ?? {};
