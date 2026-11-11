@@ -1611,17 +1611,28 @@ function registerContextTool(ctx, config) {
  * harness believes it. Closing the block path only moved the impatience here. This tool requires the
  * caller to name artifacts that actually exist before the goal is completed.
  */
+/**
+ * Completion is a claim until someone else checks it.
+ *
+ * vr_finish_goal does not complete anything: it records the claim, verifies the named artifacts
+ * exist, and hands back a brief for an independent verifier. Only vr_completion_decide can complete
+ * the goal, and only when the verifier approves. A rejection leaves the goal active — the work
+ * reopens instead of ending.
+ */
 function registerFinishTool(ctx, config) {
+  const pendingFile = (root) => path.join(root, 'COMPLETION-PENDING.json');
+
   ctx.tools.register(toolText({
     name: 'vr_finish_goal',
     description: [
-      'Complete the current goal, but only after verifying that the work exists.',
-      'Name at least one artifact — a file path or a thread id — that proves the objective was met.',
-      'Completion is refused when none of the named artifacts can be found.',
+      'Claim that the goal is finished, without completing it.',
+      'Records the claim, checks that the named artifacts exist, and returns a brief for an',
+      'independent verifier subagent. The goal is completed only when vr_completion_decide records',
+      'that approval; a rejection leaves it active.',
     ].join(' '),
     parameters: {
       summary: { type: 'string', required: true, description: 'One sentence: what is now true that was not before.' },
-      artifacts: { type: 'array', items: { type: 'string' }, required: true, description: 'Files or thread ids that prove it. At least one must exist.' },
+      artifacts: { type: 'array', items: { type: 'string' }, required: true, description: 'Files or thread ids that demonstrate it. At least one must exist.' },
     },
     async run(args, exec) {
       const goals = ctx.get('goals');
@@ -1629,34 +1640,33 @@ function registerFinishTool(ctx, config) {
       const agent = exec.agent;
       if (agent === undefined) throw new Error('no agent bound to this call');
       const view = goals.get(agent);
-      if (view === undefined) throw new Error('there is no current goal to complete');
+      if (view === undefined) throw new Error('there is no current goal to finish');
 
       const root = await researchRoot(ctx, config, exec);
       const summary = clean(args.summary, 600);
       if (summary === '') throw new Error('summary must say what is now true');
 
       const artifacts = (Array.isArray(args.artifacts) ? args.artifacts : []).map((a) => String(a).trim()).filter(Boolean);
-      if (artifacts.length === 0) {
-        throw new Error('name at least one artifact that proves the objective was met');
+      if (artifacts.length === 0) throw new Error('name at least one artifact that demonstrates the objective');
+
+      let base = process.cwd();
+      try {
+        const session = exec?.agent?.session;
+        const resolved = session === undefined ? undefined : ctx.workingDirectory.get(session);
+        if (typeof resolved === 'string' && resolved !== '') base = resolved;
+      } catch {
+        /* keep the fallback */
       }
 
       const verified = [];
       const missing = [];
       for (const artifact of artifacts) {
         if (/^thr-\d+$/.test(artifact)) {
+          // eslint-disable-next-line no-await-in-loop
           const { parsed } = await readThread(root, artifact).catch(() => ({ parsed: undefined }));
           if (parsed === undefined) missing.push(`${artifact} (no such thread)`);
           else verified.push(`${artifact} (status ${String(parsed.frontmatter.status ?? 'unknown')})`);
           continue;
-        }
-        // The host process cwd is not the session workspace; resolve against the agent's directory.
-        let base = process.cwd();
-        try {
-          const session = exec?.agent?.session;
-          const resolved = session === undefined ? undefined : ctx.workingDirectory.get(session);
-          if (typeof resolved === 'string' && resolved !== '') base = resolved;
-        } catch {
-          /* keep the fallback */
         }
         const candidates = path.isAbsolute(artifact)
           ? [artifact]
@@ -1675,18 +1685,101 @@ function registerFinishTool(ctx, config) {
 
       if (verified.length === 0) {
         throw new Error(
-          `refusing to complete: none of the named artifacts exist (${missing.join(', ')}). `
+          `refusing to finish: none of the named artifacts exist (${missing.join(', ')}). `
           + 'The objective is not demonstrably done — keep working, or record what remains with vr_defer.',
         );
       }
 
-      const completed = goals.complete(agent, { id: view.id, revision: view.revision });
+      await writeAtomic(
+        pendingFile(root),
+        JSON.stringify({
+          goalId: String(view.id),
+          objective: String(view.objective ?? ''),
+          summary,
+          artifacts,
+          verified,
+          created: nowIso(),
+        }, null, 2),
+      );
+
       return [
-        `goal completed: ${summary}`,
-        `verified: ${verified.join(', ')}`,
-        missing.length > 0 ? `ignored (not found): ${missing.join(', ')}` : '',
+        'completion claimed, not granted. The goal stays active until a verifier approves it.',
+        '',
+        'Spawn ONE subagent with exactly this brief:',
+        '',
+        [
+          'You are the completion verifier. Decide one question only.',
+          '',
+          `Objective: ${String(view.objective ?? '(none)')}`,
+          `Claimed completion: ${summary}`,
+          `Artifacts named: ${verified.join(', ')}`,
+          '',
+          'Read the artifacts yourself with the read tool. Then judge:',
+          '- Do the artifacts actually demonstrate the objective, or merely exist?',
+          '- Is any part of the objective untouched by what was named?',
+          '- Would a reviewer who only saw these artifacts agree the work is done?',
+          '',
+          'Answer APPROVE or REJECT, then at most four sentences naming the weakest point.',
+          'Reject when the objective is only partly met. Do not accept a file because it exists.',
+        ].join('\n'),
+        '',
+        'Record the verdict with vr_completion_decide.',
+      ].join('\n');
+    },
+  }));
+
+  ctx.tools.register(toolText({
+    name: 'vr_completion_decide',
+    description: [
+      'Record the verifier verdict on a claimed completion.',
+      'APPROVE completes the goal. REJECT leaves it active, so the work reopens rather than ending.',
+    ].join(' '),
+    parameters: {
+      approved: { type: 'boolean', required: true, description: 'True only if the verifier approved.' },
+      rationale: { type: 'string', required: true, description: 'The verifier reasoning, including the weakest point.' },
+      verifier: { type: 'string', description: 'Which model or session verified.' },
+    },
+    async run(args, exec) {
+      const goals = ctx.get('goals');
+      if (goals === undefined) throw new Error('the goals service is unavailable');
+      const agent = exec.agent;
+      if (agent === undefined) throw new Error('no agent bound to this call');
+      const root = await researchRoot(ctx, config, exec);
+      const file = pendingFile(root);
+      const text = await readIfExists(file);
+      if (text === undefined) throw new Error('there is no pending completion claim; call vr_finish_goal first');
+
+      let claim;
+      try {
+        claim = JSON.parse(text);
+      } catch {
+        throw new Error('the pending completion claim is unreadable; re-run vr_finish_goal');
+      }
+
+      const approved = args.approved === true;
+      const rationale = clean(args.rationale, 600);
+      if (rationale === '') throw new Error('rationale must say why the verification succeeded or failed');
+
+      if (!approved) {
+        await fs.rm(file, { force: true });
+        return [
+          `completion REJECTED: ${rationale}`,
+          '',
+          'The goal is still active — the work reopens rather than ending.',
+          'Address the verifier objection, then call vr_finish_goal again when it is genuinely done.',
+        ].join('\n');
+      }
+
+      const view = goals.get(agent);
+      if (view === undefined) throw new Error('the goal disappeared while awaiting verification');
+      const completed = goals.complete(agent, { id: view.id, revision: view.revision });
+      await fs.rm(file, { force: true });
+      return [
+        `goal completed after independent verification: ${claim.summary}`,
+        `verified: ${(claim.verified ?? []).join(', ')}`,
+        `verifier: ${clean(args.verifier ?? 'unnamed', 80)} — ${rationale}`,
         `goal ${String(completed?.id ?? view.id)} is now ${String(completed?.phase ?? 'complete')}.`,
-      ].filter(Boolean).join('\n');
+      ].join('\n');
     },
   }));
 }
