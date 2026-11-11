@@ -28,6 +28,17 @@ const CASES = [
   ['curl -sS 127.0.0.1:8787/api -o r.out', false],
   ['curl -o out.json https://cdn.acme.test/x', true],
   ['curl -s https://api.acme.test/v4 -D headers.txt', true],
+  // Prefixed invocations reach the network exactly as the bare form does.
+  ['FOO=1 curl acme.test', true],
+  ['sudo curl acme.test', true],
+  ['time curl acme.test', true],
+  ['xargs curl acme.test', true],
+  ['sudo -u deploy curl acme.test', true],
+  ['VAR=$(curl acme.test)', true],
+  // The word "host" in prose is not an invocation of the host command. This case was a real false
+  // positive: it refused a shell call that only wrote a sentence about hostnames.
+  ['echo "the host is acme.test per the docs"', false],
+  ['python3 script.py --host acme.test', false],
 ];
 
 let failures = 0;

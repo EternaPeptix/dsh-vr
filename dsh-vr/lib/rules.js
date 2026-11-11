@@ -156,6 +156,12 @@ const NETWORK_CLIENTS = new Set([
   'nslookup', 'openssl', 'telnet', 'http', 'https', 'aria2c', 'fetch',
 ]);
 
+/** Programs that run another program: the command position is after them, not at token 0. */
+const COMMAND_WRAPPERS = new Set([
+  'sudo', 'doas', 'time', 'nohup', 'exec', 'command', 'builtin', 'env', 'nice', 'ionice',
+  'timeout', 'xargs', 'watch', 'stdbuf', 'chronic', 'unbuffer', 'script', 'xcrun',
+]);
+
 const OUTPUT_FLAGS = new Set(['-o', '-O', '--output', '-T', '--upload-file', '-D', '--dump-header']);
 
 /** Common file extensions: a token ending in one is a path the shell will create, not a host. */
@@ -192,20 +198,36 @@ export function networkHostsIn(commandText) {
     const host = hostOf(match);
     if (host !== undefined && host !== '') hosts.add(host);
   }
-  const segments = text.split(/\n|\|\||&&|;|\|/);
+  // Command substitution is where a host usually hides: `VAR=$(curl host)` and backticks.
+  const segments = text.split(/\n|\|\||&&|;|\||\$\(|`/);
   for (const segment of segments) {
     const tokens = segment.trim().split(/\s+/).filter(Boolean);
     if (tokens.length === 0) continue;
-    // A client is rarely token 0: env assignments, sudo, time, nohup, xargs and wrappers all
-    // precede it, and checking only token 0 let every prefixed invocation through.
-    let clientIndex = -1;
-    for (let i = 0; i < tokens.length; i += 1) {
-      const candidate = tokens[i].replace(/^.*\//, '').toLowerCase();
-      if (NETWORK_CLIENTS.has(candidate)) {
-        clientIndex = i;
-        break;
+    // A client is rarely token 0: env assignments, sudo, time, nohup, xargs and similar wrappers
+    // precede it, and checking only token 0 let every prefixed invocation through. Scanning every
+    // token instead made an English sentence containing the word "host" look like a DNS lookup, so
+    // the client has to sit at a command position: first token, or first token after wrappers.
+    let i = 0;
+    let sawWrapper = false;
+    let skipOperand = false;
+    while (i < tokens.length) {
+      const token = tokens[i];
+      const bare = token.replace(/^.*\//, '').toLowerCase();
+      if (skipOperand) { skipOperand = false; i += 1; continue; }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) { i += 1; continue; }
+      if (token.startsWith('-')) {
+        // The operand of a wrapper's own flag is not a program: `sudo -u deploy curl host`.
+        skipOperand = sawWrapper;
+        i += 1;
+        continue;
       }
+      if (COMMAND_WRAPPERS.has(bare)) { sawWrapper = true; i += 1; continue; }
+      if (/^\d+[smhd]?$/.test(token)) { i += 1; continue; }
+      break;
     }
+    const clientIndex = i < tokens.length && NETWORK_CLIENTS.has(tokens[i].replace(/^.*\//, '').toLowerCase())
+      ? i
+      : -1;
     if (clientIndex === -1) continue;
     const tokens$ = tokens.slice(clientIndex + 1);
     for (let index = 0; index < tokens$.length; index += 1) {
@@ -218,9 +240,10 @@ export function networkHostsIn(commandText) {
       if (FILE_OPERAND.has(token)) continue;
       // Shell variables and substitutions are not hosts; they are resolved at run time.
       if (/[$`{}]/.test(token)) continue;
-      // Strip a user@ prefix (ssh/scp) and an scp-style :path suffix before judging the token.
+      // Strip a user@ prefix (ssh/scp), an scp-style :path suffix, and any trailing punctuation
+      // left behind by a command substitution such as `VAR=$(curl host)`.
       const bare = token.includes('@') ? token.slice(token.indexOf('@') + 1) : token;
-      const hostPart = bare.replace(/:[^0-9/].*$/, '');
+      const hostPart = bare.replace(/:[^0-9/].*$/, '').replace(/[),.;]+$/, '');
       if (!DOMAIN_TOKEN.test(hostPart)) continue;
       if (looksLikeFile(hostPart)) continue;
       const host = hostOf(hostPart);
@@ -228,6 +251,23 @@ export function networkHostsIn(commandText) {
     }
   }
   return [...hosts];
+}
+
+/** Scope entries are compared as bare hostnames; a wildcard records the domain it permits. */
+export function normaliseHost(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^\*\./, '')
+    .replace(/\/.*$/, '')
+    .replace(/:\d+$/, '');
+}
+
+/** Whether `host` is covered by an entry of `seen`: equal, or a subdomain of it. */
+export function hostGrounded(host, seen) {
+  const target = normaliseHost(host);
+  return seen.map(normaliseHost).some((entry) => target === entry || target.endsWith(`.${entry}`));
 }
 
 /** Does any contacted host fall under a denied domain (exact or subdomain)? */

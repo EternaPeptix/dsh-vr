@@ -11,6 +11,8 @@
 import {
   evaluateGate,
   fenced,
+  hostGrounded,
+  normaliseHost,
   parseStateFile,
   renderThread,
 } from '../lib/rules.js';
@@ -169,6 +171,18 @@ check(
   !Array.isArray(hashedGate.caveats) || hashedGate.caveats.length === 0,
   JSON.stringify(hashedGate.caveats),
 );
+
+// --- scope grounding ------------------------------------------------------
+// Scope approval is refused unless allowed_hosts are covered by the hosts the judge listed. These
+// are the comparisons that decision rests on, including the shapes that look right and are not.
+check('a subdomain is grounded by its parent', hostGrounded('api.example.com', ['example.com']) === true);
+check('a lookalike suffix is not grounded', hostGrounded('example.com.evil.test', ['example.com']) === false);
+check('a wildcard entry grounds its own domain', hostGrounded('example.com', ['*.example.com']) === true);
+check('a wildcard entry does not ground a different site', hostGrounded('evil.test', ['*.example.com']) === false);
+check('a scheme and path are stripped before comparison', hostGrounded('https://api.example.com/v1/x', ['example.com']) === true);
+check('an empty list grounds nothing', hostGrounded('example.com', []) === false);
+check('a port on the scope entry does not defeat the comparison', hostGrounded('example.com', ['example.com:8443']) === true);
+check('normaliseHost strips scheme, wildcard, path and port', normaliseHost('https://*.Example.com:8443/x') === 'example.com');
 
 console.log(failures === 0 ? 'all regression cases passed' : `${failures} regression case(s) failed`);
 process.exit(failures === 0 ? 0 : 1);
