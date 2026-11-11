@@ -11,6 +11,7 @@
 import {
   dashboardRequestAllowed,
   evaluateGate,
+  executionAttestation,
   fenced,
   hostGrounded,
   normaliseHost,
@@ -224,6 +225,26 @@ check('a configured tunnel host is served when named',
   dashboardRequestAllowed({ host: 'tunnel.example' }, ['tunnel.example']).allowed === true);
 check('a configured tunnel host is still refused without its Origin',
   dashboardRequestAllowed({ host: 'tunnel.example', origin: 'https://other.example' }, ['tunnel.example']).allowed === false);
+
+// --- executed evidence is attested against the ledger ----------------------
+// The harness cannot see the target being run; it can see whether any tool call finished in the
+// session that wrote the record. Silence about the difference was the defect.
+const executedState = { id: 'E-001', exists: true, kind: 'execution', session: 'sess-a' };
+const ledger = [{ event: 'tool_end', session: 'sess-a', tool: 'bash' }];
+check('an execution whose session shows a finished tool call is not questioned',
+  executionAttestation([executedState], ledger).length === 0);
+check('an execution whose session shows nothing is reported',
+  executionAttestation([executedState], []).length === 1);
+check('a tool that started but never finished does not count',
+  executionAttestation([executedState], [{ event: 'tool_start', session: 'sess-a' }]).length === 1);
+check('another session does not attest it',
+  executionAttestation([executedState], [{ event: 'tool_end', session: 'sess-b' }]).length === 1);
+check('a record with no session is reported',
+  executionAttestation([{ id: 'E-002', exists: true, kind: 'execution', session: '' }], ledger).length === 1);
+check('static evidence is not questioned',
+  executionAttestation([{ id: 'E-003', exists: true, kind: 'static', session: '' }], ledger).length === 0);
+check('a missing evidence file is not questioned',
+  executionAttestation([{ id: 'E-004', exists: false, kind: 'execution', session: '' }], ledger).length === 0);
 
 console.log(failures === 0 ? 'all regression cases passed' : `${failures} regression case(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

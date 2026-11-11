@@ -27,3 +27,5 @@
   revalidation, because both described the evidence set that just changed.
 - The dashboard refuses requests whose Host or Origin is not loopback (DNS rebinding), and reuses
   its built state for `dashboardCacheMs` instead of rebuilding on every poll.
+- Evidence records carry the session that wrote them, and `vr_gate` reports executed evidence that
+  session cannot attest as a caveat rather than accepting it silently.

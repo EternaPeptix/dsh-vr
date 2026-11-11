@@ -48,6 +48,7 @@ import {
   hostGrounded,
   readinessInvalidatedBy,
   dashboardRequestAllowed,
+  executionAttestation,
 } from './rules.js';
 
 const name = 'dsh-vr';
@@ -410,6 +411,8 @@ async function evidenceStatesFor(root, id, parsed) {
       // How the claim was established, and how far the harness that established it reaches.
       kind: String(evidence.frontmatter.kind ?? '').trim().toLowerCase() || undefined,
       tier: String(evidence.frontmatter.tier ?? '').trim().toLowerCase() || undefined,
+      // Which session wrote the record, so the gate can ask whether anything ran there.
+      session: String(evidence.frontmatter.session ?? '').trim(),
     });
   }
   return states;
@@ -972,6 +975,7 @@ function registerStateTools(ctx, config) {
         configuration: clean(args.configuration ?? 'unspecified', 200),
         kind,
         tier,
+        session: typeof exec?.agent?.session?.id === 'string' ? exec.agent.session.id : '-',
         created: nowIso(),
       };
       // Freeze what is cited: hash the bytes at record time so a later citation cannot silently rot.
@@ -1192,6 +1196,10 @@ function registerStateTools(ctx, config) {
       const { parsed } = await readThread(root, id);
       const evidenceStates = await evidenceStatesFor(root, id, parsed);
       const gate = evaluateGate(parsed, evidenceStates);
+      // Attestation is a cross-check against harness output, not evidence; it is reported with the
+      // other caveats so an unattested execution is visible instead of silently accepted.
+      const ledger = await readTelemetryTail(path.join(root, 'telemetry', 'events.jsonl'));
+      gate.caveats = [...(gate.caveats ?? []), ...executionAttestation(evidenceStates, ledger)];
       const fm = parsed.frontmatter;
       // Per-verdict telemetry: which rules actually fire is the only way to tell whether a rule
       // is load-bearing or noise. The gate itself stays deterministic.
@@ -2477,6 +2485,28 @@ function registerScanTool(ctx, config) {
       ].filter(Boolean).join('\n');
     },
   }));
+}
+
+/**
+ * The last `maxLines` telemetry rows, parsed. Bounded on purpose: the ledger is a rotating file, and
+ * a readiness decision must not depend on reading all of it.
+ */
+async function readTelemetryTail(file, maxLines = 20000) {
+  try {
+    const text = await fs.readFile(file, 'utf8');
+    const lines = text.split('\n').filter((line) => line.trim() !== '');
+    const rows = [];
+    for (const line of lines.slice(-maxLines)) {
+      try {
+        rows.push(JSON.parse(line));
+      } catch {
+        /* a truncated last line is not a reason to fail the gate */
+      }
+    }
+    return rows;
+  } catch {
+    return [];
+  }
 }
 
 async function appendTelemetry(file, record, maxBytes) {

@@ -15,6 +15,13 @@
         deniedHosts: "vendor-a.example,vendor-b.example"
         enforceAllowedHosts: true
         referenceHosts: ""
+        # Loopback stays reachable so local reproducers work without a scope edit. Set false when the
+        # engagement must not run local servers.
+        allowLoopback: true
+        # Extra Host values the findings dashboard may be served under. Leave empty unless you put a
+        # tunnel in front of it; loopback Hosts are always accepted.
+        dashboardAllowHosts: ""
+        dashboardCacheMs: 1500
         questionTimeoutSeconds: 300
         redirectQuestionTool: true
         goalDiscipline: true

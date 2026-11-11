@@ -388,6 +388,43 @@ export function missingStageRequirements(stage, parsed, evidenceStates) {
 }
 
 /**
+ * Cross-check executed evidence against the harness's own record of what ran.
+ *
+ * `kind: execution` is an attestation by the researcher: the harness cannot see whether the target
+ * was really run. It can see, however, whether any tool call finished in the session that recorded
+ * the evidence. That is not proof — telemetry is harness output, not evidence, and a shell call is
+ * not necessarily the execution being described — so a mismatch is reported as a caveat rather than
+ * used to block. Silence about it was the actual defect.
+ */
+export function executionAttestation(evidenceStates, events) {
+  const rows = Array.isArray(events) ? events : [];
+  const endedBySession = new Map();
+  for (const row of rows) {
+    if (row?.event !== 'tool_end') continue;
+    const session = String(row.session ?? '');
+    if (session === '' || session === '-') continue;
+    endedBySession.set(session, (endedBySession.get(session) ?? 0) + 1);
+  }
+  const caveats = [];
+  for (const state of Array.isArray(evidenceStates) ? evidenceStates : []) {
+    if (state?.exists !== true || state.kind !== 'execution') continue;
+    const session = String(state.session ?? '').trim();
+    if (session === '' || session === '-') {
+      caveats.push(
+        `${state.id} claims kind execution but records no session: nothing ties it to a tool call that ran`,
+      );
+      continue;
+    }
+    if (!endedBySession.has(session)) {
+      caveats.push(
+        `${state.id} claims kind execution but the ledger holds no finished tool call for session ${session}: unattested (telemetry may be off, or the record was written elsewhere)`,
+      );
+    }
+  }
+  return caveats;
+}
+
+/**
  * Report readiness.
  *
  * Checks that the claim is at a stage where reporting is meaningful, that its evidence is linked
@@ -524,7 +561,7 @@ function cleanText(value, cap = 4000) {
 }
 
 export const EVIDENCE_FRONTMATTER = [
-  'id', 'thread', 'target_revision', 'configuration', 'kind', 'tier', 'created',
+  'id', 'thread', 'target_revision', 'configuration', 'kind', 'tier', 'session', 'created',
 ];
 
 /** Fence captured output, unwrapping any fence it was stored inside so re-renders stay stable. */
