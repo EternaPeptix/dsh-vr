@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- Findings panel: aborts an in-flight read when it unmounts, reports a failed read instead of going
+  blank, shows when it last succeeded, isolates a table that fails to render behind an error
+  boundary, and can blur finding text for screen sharing.
 - A completion verdict is refused when the pending claim names a different goal, when the objective
   changed, when the claim is older than `completionClaimMinutes`, or when a named artifact changed
   after the claim was made.
