@@ -11,6 +11,7 @@
  * not about the schema's runtime semantics.
  */
 import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -27,10 +28,13 @@ const check = (name, ok, detail) => {
   }
 };
 
+// Registration itself writes telemetry, so the state root must not be the repository.
+const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-vr-load-'));
+
 /** Every Config default, spelled out: the schema cannot be introspected through the stub. */
 const config = {
   enabled: true,
-  root: 'research',
+  root: stateRoot,
   telemetry: true,
   telemetryMaxBytes: 8 * 1024 * 1024,
   maxFileBytes: 4 * 1024 * 1024,
@@ -126,6 +130,8 @@ try {
 }
 check('a missing service is reported as the tool refusing, not as a crash',
   thrown instanceof Error && thrown.message.startsWith('vr_context:'), thrown?.message);
+
+await fs.rm(stateRoot, { recursive: true, force: true });
 
 console.log(failures === 0 ? 'all load cases passed' : `${failures} load case(s) failed`);
 process.exit(failures === 0 ? 0 : 1);
