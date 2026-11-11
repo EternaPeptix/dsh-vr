@@ -315,8 +315,9 @@ function scopeJudgeBrief(action, detail) {
     'Approve only if every host in the request appears in your list. You may not approve a request',
     'whose transcription is only shorthand.',
     '',
-    'Then the orchestrator records your verdict with vr_scope_decide, passing your host list as',
-    'hosts_seen. An approval whose allowed_hosts are not covered by that list is refused.',
+    'Then the orchestrator records your verdict with vr_scope_decide, passing this reply verbatim',
+    'as judge_answer. The host line is read out of that reply, so writing it precisely is what makes',
+    'the verdict checkable: an approval whose allowed_hosts your list does not cover is refused.',
   ].join('\n');
 }
 
@@ -2100,10 +2101,14 @@ function registerScopeTools(ctx, config) {
       // A pending request means this verdict closes an expansion, not the engagement's scope.
       // Rejecting an expansion must leave the existing qualification exactly as it was.
       const isExpansion = pending.trim() !== '';
-      const existingHosts = String(fm.allowed_hosts ?? '').split(',').map(normaliseHost).filter(Boolean);
-      const requestedHosts = isExpansion
-        ? [...pending.matchAll(/requested host:\s*(\S+)/gi)].map((match) => normaliseHost(match[1])).filter(Boolean)
+      // Comparisons use normalised hostnames; what is written back keeps the entries as recorded, so
+      // an approval cannot quietly rewrite a scoped port or a wildcard into its bare domain.
+      const existingRaw = String(fm.allowed_hosts ?? '').split(',').map((host) => host.trim()).filter(Boolean);
+      const requestedRaw = isExpansion
+        ? [...pending.matchAll(/requested host:\s*(\S+)/gi)].map((match) => match[1].trim()).filter(Boolean)
         : [];
+      const existingHosts = existingRaw.map(normaliseHost).filter(Boolean);
+      const requestedHosts = requestedRaw.map(normaliseHost).filter(Boolean);
       const prospectiveHosts = [...new Set([...existingHosts, ...requestedHosts])];
       const passedHosts = (Array.isArray(args.hosts_seen) ? args.hosts_seen : []).map(normaliseHost).filter(Boolean);
       // The judge answer is read here rather than trusted: whoever transcribes it must also transcribe
@@ -2145,7 +2150,16 @@ function registerScopeTools(ctx, config) {
             'Re-run the judge with the full enumeration, or reject and fix the scope.',
           ].join(' '));
         }
-        if (requestedHosts.length > 0) fm.allowed_hosts = prospectiveHosts.join(', ');
+        if (requestedRaw.length > 0) {
+          const seen = new Set(existingHosts);
+          const appended = requestedRaw.filter((host) => {
+            const normalised = normaliseHost(host);
+            if (normalised === '' || seen.has(normalised)) return false;
+            seen.add(normalised);
+            return true;
+          });
+          fm.allowed_hosts = [...existingRaw, ...appended].join(', ');
+        }
         if (isExpansion) delete sections['Pending scope request'];
         // An approved expansion merges hosts; it does not qualify the engagement.
         else fm.confirmed = 'true';
