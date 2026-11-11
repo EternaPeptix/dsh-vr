@@ -203,6 +203,8 @@ otherwise invisible until a Host refuses to start.
 
 ## Repository layout
 
+Paths are relative to `dsh-vr/`.
+
 ```
 lib/index.js        tools, guards, telemetry, dashboard route
 lib/rules.js        pure gate and parsing rules, shared by tools and tests
