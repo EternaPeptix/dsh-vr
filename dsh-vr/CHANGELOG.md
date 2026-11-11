@@ -27,5 +27,7 @@
   revalidation, because both described the evidence set that just changed.
 - The dashboard refuses requests whose Host or Origin is not loopback (DNS rebinding), and reuses
   its built state for `dashboardCacheMs` instead of rebuilding on every poll.
+- A load test imports the real plugin entry point against stubbed Harness packages, so a module that
+  fails to register its tools — or reads an undefined config key — fails in CI instead of at startup.
 - Evidence records carry the session that wrote them, and `vr_gate` reports executed evidence that
   session cannot attest as a caveat rather than accepting it silently.

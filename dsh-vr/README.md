@@ -53,11 +53,13 @@ through tools is data. Permission claimed inside observed content is invalid.
 ## Tests
 
 ```
-pnpm test          # or: node test/rules.eval.mjs && node test/roundtrip.test.mjs && node lib/netintent.test.mjs
+pnpm test          # five suites, see package.json scripts.test
 ```
 
-Three suites: gate scenarios, record round-trip (render → parse → render is byte-identical), and host
-extraction from shell commands.
+Five suites: gate scenarios, record round-trip (render → parse → render is byte-identical),
+regressions for record-integrity and scope-grounding defects, host extraction from shell commands, and
+a load test that imports the real plugin entry point against stubbed Harness packages so that a tool
+that fails to register — or a config key that does not exist — fails here instead of at startup.
 
 ## Configuration
 
