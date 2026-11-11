@@ -1367,6 +1367,14 @@ function registerGoalDiscipline(ctx, config) {
   ctx.effect(() => ctx.tools.guard((execution) => {
     if (execution.name !== 'update_goal') return undefined;
     const action = execution.arguments?.action;
+    if (action === 'complete') {
+      return [
+        'refusing to complete the goal this way.',
+        'update_goal action=complete accepts no evidence that the objective was met, so any claim passes.',
+        'Call vr_finish_goal instead: it takes a one-sentence summary and at least one artifact — an',
+        'existing file path or a thread id — and refuses to complete when none of them can be found.',
+      ].join(' ');
+    }
     if (action !== 'blocked') return undefined;
 
     const reason = String(execution.arguments?.blocked_reason ?? '').trim();
@@ -1592,6 +1600,93 @@ function registerContextTool(ctx, config) {
       lines.push(`route: ${requestContext?.provider ?? 'unknown'}/${requestContext?.model ?? 'unknown'}`);
       lines.push(`baseline: ${measurement.baseline.kind} · surface nodes: ${measurement.nodes.length}`);
       return lines.join('\n');
+    },
+  }));
+}
+
+/**
+ * Completion that has to point at something.
+ *
+ * `update_goal action=complete` accepts no evidence: the agent asserts the objective is met and the
+ * harness believes it. Closing the block path only moved the impatience here. This tool requires the
+ * caller to name artifacts that actually exist before the goal is completed.
+ */
+function registerFinishTool(ctx, config) {
+  ctx.tools.register(toolText({
+    name: 'vr_finish_goal',
+    description: [
+      'Complete the current goal, but only after verifying that the work exists.',
+      'Name at least one artifact — a file path or a thread id — that proves the objective was met.',
+      'Completion is refused when none of the named artifacts can be found.',
+    ].join(' '),
+    parameters: {
+      summary: { type: 'string', required: true, description: 'One sentence: what is now true that was not before.' },
+      artifacts: { type: 'array', items: { type: 'string' }, required: true, description: 'Files or thread ids that prove it. At least one must exist.' },
+    },
+    async run(args, exec) {
+      const goals = ctx.get('goals');
+      if (goals === undefined) throw new Error('the goals service is unavailable');
+      const agent = exec.agent;
+      if (agent === undefined) throw new Error('no agent bound to this call');
+      const view = goals.get(agent);
+      if (view === undefined) throw new Error('there is no current goal to complete');
+
+      const root = await researchRoot(ctx, config, exec);
+      const summary = clean(args.summary, 600);
+      if (summary === '') throw new Error('summary must say what is now true');
+
+      const artifacts = (Array.isArray(args.artifacts) ? args.artifacts : []).map((a) => String(a).trim()).filter(Boolean);
+      if (artifacts.length === 0) {
+        throw new Error('name at least one artifact that proves the objective was met');
+      }
+
+      const verified = [];
+      const missing = [];
+      for (const artifact of artifacts) {
+        if (/^thr-\d+$/.test(artifact)) {
+          const { parsed } = await readThread(root, artifact).catch(() => ({ parsed: undefined }));
+          if (parsed === undefined) missing.push(`${artifact} (no such thread)`);
+          else verified.push(`${artifact} (status ${String(parsed.frontmatter.status ?? 'unknown')})`);
+          continue;
+        }
+        // The host process cwd is not the session workspace; resolve against the agent's directory.
+        let base = process.cwd();
+        try {
+          const session = exec?.agent?.session;
+          const resolved = session === undefined ? undefined : ctx.workingDirectory.get(session);
+          if (typeof resolved === 'string' && resolved !== '') base = resolved;
+        } catch {
+          /* keep the fallback */
+        }
+        const candidates = path.isAbsolute(artifact)
+          ? [artifact]
+          : [path.resolve(base, artifact), path.resolve(root, artifact)];
+        let found = false;
+        for (const candidate of candidates) {
+          // eslint-disable-next-line no-await-in-loop
+          if (await fs.access(candidate).then(() => true).catch(() => false)) {
+            found = true;
+            break;
+          }
+        }
+        if (found) verified.push(artifact);
+        else missing.push(artifact);
+      }
+
+      if (verified.length === 0) {
+        throw new Error(
+          `refusing to complete: none of the named artifacts exist (${missing.join(', ')}). `
+          + 'The objective is not demonstrably done — keep working, or record what remains with vr_defer.',
+        );
+      }
+
+      const completed = goals.complete(agent, { id: view.id, revision: view.revision });
+      return [
+        `goal completed: ${summary}`,
+        `verified: ${verified.join(', ')}`,
+        missing.length > 0 ? `ignored (not found): ${missing.join(', ')}` : '',
+        `goal ${String(completed?.id ?? view.id)} is now ${String(completed?.phase ?? 'complete')}.`,
+      ].filter(Boolean).join('\n');
     },
   }));
 }
@@ -2478,6 +2573,7 @@ function apply(ctx, config) {
   registerDeferTool(ctx, config);
   registerFanoutTool(ctx, config);
   registerContextTool(ctx, config);
+  registerFinishTool(ctx, config);
   if (config.telemetry) registerTelemetry(ctx, config);
   registerBoundaryGuard(ctx, config);
   registerStateEnrichment(ctx, config);
